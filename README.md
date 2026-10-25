@@ -138,7 +138,7 @@ The bridge turns on by itself when all four of these are set:
 
 `bot_bridge.enabled: false` forces it off even when those values are present. While it is off, the `ask_rbd_team` tool is not offered to the model.
 
-On a work question Milo makes a `request_id` and posts `{request_id, device_id, question, asked_at, reply_by}` to the webhook. The header name and prefix come from `bot_bridge.key_header` and `bot_bridge.key_prefix`. Copy both from the Grok Bot routine panel. Quote the prefix so a trailing space is kept:
+Brenda's routine expects the header `Authorization: Bearer <key>`. That is the default. The key is `GVA_GROKBOT_WEBHOOK_KEY` and the URL is `GVA_GROKBOT_WEBHOOK_URL`, both from `/etc/gva/gva.env`. The header name and prefix stay settable in `config.yaml` (`bot_bridge.key_header`, `bot_bridge.key_prefix`) if a routine uses another format. Quote the prefix so the trailing space stays:
 
 ```yaml
 bot_bridge:
@@ -146,7 +146,9 @@ bot_bridge:
   key_prefix: "Bearer "
 ```
 
-If the panel sends the key with no prefix, set `key_prefix: ""`. The header value is then the key on its own. The header name can be changed the same way, for example `key_header: X-Api-Key`. The post times out after 10 seconds and is tried once more. The key is never written to the log. A query string on the webhook URL is never written either.
+Set `key_prefix: ""` to send the key with no prefix. The post times out after 10 seconds and is tried once more. The key is never written to the log or printed by `gva bridge test`. A query string on the webhook URL is never written either.
+
+Each post body is `{"request_id", "device_id", "question", "asked_at", "reply_by"}`.
 
 Milo says it is checking with the team, then polls `public.milo_bot_answers` until the answer arrives or `bot_bridge.timeout_s` runs out (five minutes by default, because a routine can start a few minutes late). About 45 seconds in, Milo says once: "Still checking with the team." Polling continues after the voice session has closed and Milo is back on the wake word. When a row arrives in time, Milo reads it out. If the session is still open, it is spoken there. If the session has closed, Milo plays a short chime, then reads the text on a short realtime session (verbatim), or with Piper if that session cannot start. The row's `read_at` is filled in afterwards. If nothing arrives in time, Milo says: "Sorry, the team didn't get back to me in time. I'll have it next time you ask." The request is kept. A later row is still read out on the next wake, or when you ask "any answer yet?".
 
@@ -180,9 +182,9 @@ sudo bash deploy/update.sh
 Then:
 
 1. Put the webhook URL and key in `/etc/gva/gva.env` (mode `0600`, owner `gva`). The names are in `gva.env.example`. Leave both blank to keep the bridge off.
-2. In `/etc/gva/config.yaml`, set `bot_bridge.key_header` and `bot_bridge.key_prefix` to the format from the Grok Bot routine panel.
-3. Run `gva doctor`. It prints `bridge: configured, milo_bot_answers reachable`, or `bridge: not configured`. It does not print the key or the webhook URL. If the table cannot be reached, that is a warning. The voice service still starts.
-4. Run `gva bridge test "What reports are due this week?"` and wait for the answer.
+2. Leave `bot_bridge.key_header` and `bot_bridge.key_prefix` at the defaults unless Brenda's routine panel shows a different header. The defaults are `Authorization` and `Bearer `.
+3. Run `sudo gva doctor`. It prints `bridge: configured, milo_bot_answers reachable`, or `bridge: not configured`. It does not print the key or the webhook URL. If the table cannot be reached, that is a warning. The voice service still starts.
+4. Run `sudo gva bridge test`. It sends a fixed harmless question and prints the webhook HTTP status and `answer: yes` or `answer: no`. It does not print the key or the answer text. A row it receives is marked read, so Milo does not say it again on the next wake.
 5. If `gva-voice` is already enabled, `deploy/update.sh` restarts it. Otherwise `sudo systemctl restart gva-voice`.
 
 ## Troubleshooting

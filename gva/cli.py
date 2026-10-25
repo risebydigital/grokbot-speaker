@@ -180,26 +180,23 @@ def doctor() -> None:
 
 
 @bridge_app.command("test")
-def bridge_test(question: str) -> None:
-    """Send one work question and wait for the team's answer."""
+def bridge_test(
+    question: str | None = typer.Argument(None, help="Optional. Default is a fixed harmless test question."),
+) -> None:
+    """Send a harmless test question. Print the webhook status and whether an answer arrived."""
     cfg = _cfg()
-    from gva.runtime.bridge import TIMEOUT_LINE, BotBridge, BridgeError, BridgeTimeout, bridge_configured
+    from gva.runtime.bridge import BotBridge, bridge_configured
 
     if not bridge_configured(cfg):
         typer.echo("bridge: not configured", err=True)
         raise typer.Exit(1)
     store = _store(cfg)
     events = _events(cfg, store)
-    bridge = BotBridge(cfg, events)
-    try:
-        answer = bridge.send_and_wait(question)
-    except BridgeTimeout:
-        typer.echo(TIMEOUT_LINE, err=True)
-        raise typer.Exit(1) from None
-    except BridgeError:
-        typer.echo("could not reach the team", err=True)
-        raise typer.Exit(1) from None
-    typer.echo(answer)
+    report = BotBridge(cfg, events).run_test(question)
+    for line in report.lines():
+        typer.echo(line)
+    if not report.ok():
+        raise typer.Exit(1)
 
 
 @app.command()

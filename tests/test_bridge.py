@@ -15,7 +15,6 @@ from gva.runtime.bridge import (
     TIMEOUT_LINE,
     WAITING_LINE,
     BridgeError,
-    BridgeTimeout,
     BotBridge,
     bridge_configured,
     bridge_status,
@@ -358,6 +357,41 @@ def test_late_answer_is_kept_for_the_next_wake_or_a_later_ask(monkeypatch, tmp_p
     _assert_clean(_logged(tmp_path, store).replace(ANSWER, ""))
 
 
+def test_bridge_test_reports_http_status_and_whether_an_answer_arrived(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    http.rows = [{"answer": "ready", "answered_by": "Brenda"}]
+    _cfg, store, _events, bridge = _bridge(tmp_path, http, speaker=lambda _text: None)
+    report = bridge.run_test()
+    assert report.http_status == 200
+    assert report.arrived is True
+    assert report.answered_by == "Brenda"
+    assert report.ok() is True
+    assert report.lines() == ["webhook: HTTP 200", "answer: yes", "answered_by: Brenda"]
+    posted = http.posts[0]
+    assert posted["headers"]["Authorization"] == "Bearer " + WEBHOOK_KEY
+    assert set(posted["json"]) == {"request_id", "device_id", "question", "asked_at", "reply_by"}
+    assert posted["json"]["question"].startswith("Milo bridge test.")
+    assert http.patches
+    blob = _logged(tmp_path, store)
+    assert WEBHOOK_KEY not in blob
+    assert "ready" not in blob
+    assert "Brenda" not in blob
+    text = "\n".join(report.lines())
+    assert WEBHOOK_KEY not in text
+    assert "ready" not in text
+
+    http2 = FakeHttp()
+    http2.post_results = [_Resp(401, {"detail": WEBHOOK_KEY})]
+    _cfg, store2, _events, bridge2 = _bridge(tmp_path / "denied", http2)
+    missed = bridge2.run_test()
+    assert missed.http_status == 401
+    assert missed.arrived is False
+    assert missed.lines() == ["webhook: HTTP 401", "answer: no"]
+    assert WEBHOOK_KEY not in "\n".join(missed.lines())
+    assert _logged(tmp_path / "denied", store2).count(WEBHOOK_KEY) == 0
+
+
 def test_answer_after_the_session_closed_chimes_and_speaks(monkeypatch, tmp_path):
     _enable(monkeypatch)
     http = FakeHttp()
@@ -521,23 +555,35 @@ def test_bridge_cli(monkeypatch, tmp_path):
     assert "not configured" in text
 
     _enable(monkeypatch)
-    monkeypatch.setattr(
-        "gva.runtime.bridge.BotBridge.send_and_wait",
-        lambda self, question: ANSWER,
-    )
-    result = CliRunner().invoke(app, ["bridge", "test", QUESTION])
+
+    class _Report:
+        def lines(self):
+            return ["webhook: HTTP 200", "answer: yes", "answered_by: Brenda"]
+
+        def ok(self):
+            return True
+
+    monkeypatch.setattr("gva.runtime.bridge.BotBridge.run_test", lambda self, question=None: _Report())
+    result = CliRunner().invoke(app, ["bridge", "test"])
     assert result.exit_code == 0
-    assert ANSWER in (result.output or "")
+    assert "webhook: HTTP 200" in (result.output or "")
+    assert "answer: yes" in (result.output or "")
     assert WEBHOOK_KEY not in (result.output or "")
+    assert ANSWER not in (result.output or "")
 
-    def _timeout(self, question):
-        raise BridgeTimeout(TIMEOUT_LINE)
+    class _Miss:
+        def lines(self):
+            return ["webhook: HTTP 200", "answer: no"]
 
-    monkeypatch.setattr("gva.runtime.bridge.BotBridge.send_and_wait", _timeout)
-    result = CliRunner().invoke(app, ["bridge", "test", QUESTION])
+        def ok(self):
+            return False
+
+    monkeypatch.setattr("gva.runtime.bridge.BotBridge.run_test", lambda self, question=None: _Miss())
+    result = CliRunner().invoke(app, ["bridge", "test"])
     text = (result.output or "") + (getattr(result, "stderr", None) or "")
     assert result.exit_code == 1
-    assert TIMEOUT_LINE in text
+    assert "answer: no" in text
+    assert WEBHOOK_KEY not in text
 
     monkeypatch.setattr("gva.runtime.bridge.probe_answers", lambda cfg: (True, "ok"))
     doctor = CliRunner().invoke(app, ["doctor"])

@@ -26,6 +26,9 @@ STILL_CHECKING_LINE = "Still checking with the team."
 TIMEOUT_LINE = "Sorry, the team didn't get back to me in time. I'll have it next time you ask."
 NOT_YET_LINE = "Nothing back from the team yet."
 UNREACHABLE_LINE = "Sorry, I couldn't reach the team just now."
+# Fixed text for `gva bridge test`. It asks for no real work.
+HARMLESS_QUESTION = "Milo bridge test. Please reply with the single word ready."
+_BOT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 .'-]{0,79}")
 
 CALENDAR_BULLET = (
     "- Calendar and reports are not connected. If asked, call get_calendar_events "
@@ -50,6 +53,25 @@ class BridgeError(RuntimeError):
 
 class BridgeTimeout(BridgeError):
     pass
+
+
+class BridgeTestReport:
+    """What `gva bridge test` may print. No key, URL, question, or answer text."""
+
+    def __init__(self, http_status: int | None, arrived: bool, answered_by: str | None = None):
+        self.http_status = http_status
+        self.arrived = arrived
+        self.answered_by = answered_by
+
+    def lines(self) -> list[str]:
+        status = f"HTTP {self.http_status}" if self.http_status else "no response"
+        lines = [f"webhook: {status}", "answer: yes" if self.arrived else "answer: no"]
+        if self.arrived and self.answered_by:
+            lines.append(f"answered_by: {self.answered_by}")
+        return lines
+
+    def ok(self) -> bool:
+        return bool(self.http_status and 200 <= self.http_status < 300 and self.arrived)
 
 
 def bridge_configured(cfg: Config) -> bool:
@@ -120,6 +142,16 @@ def probe_answers(cfg: Config, http: Any | None = None) -> tuple[bool, str]:
     return False, "bridge error"
 
 
+def _public_bot_name(value: Any) -> str | None:
+    """A short bot name such as Brenda. Anything else is dropped."""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    if not text or _BOT_NAME.fullmatch(text) is None:
+        return None
+    return text
+
+
 def _public_error(message: str) -> str:
     text = (message or "bridge error").strip()
     if _SAFE_ERROR.fullmatch(text):
@@ -168,6 +200,8 @@ class BotBridge:
         self._kept_lock = threading.Lock()
         self._kept: dict[str, int] = {}
         self._inflight: set[str] = set()
+        self._last_http_status: int | None = None
+        self._last_answered_by: str | None = None
         self.deliver = True
         self._load_kept()
 
@@ -200,6 +234,22 @@ class BotBridge:
         else:
             self._watch(request_id, started)
         return request_id
+
+    def run_test(self, question: str | None = None) -> BridgeTestReport:
+        """POST a harmless question and wait. Does not speak and does not return the answer text."""
+        previous = self.deliver
+        self.deliver = False
+        self._last_http_status = None
+        self._last_answered_by = None
+        try:
+            try:
+                request_id, started = self._send(question or HARMLESS_QUESTION)
+            except BridgeError:
+                return BridgeTestReport(self._last_http_status, False, None)
+            answer = self._watch(request_id, started)
+        finally:
+            self.deliver = previous
+        return BridgeTestReport(self._last_http_status, bool(answer), self._last_answered_by if answer else None)
 
     def send_and_wait(self, question: str) -> str:
         """CLI path. Prints nothing and does not play audio. Raises on failure."""
@@ -279,6 +329,8 @@ class BotBridge:
                     continue
                 break
             code = int(getattr(response, "status_code", 0) or 0)
+            if code:
+                self._last_http_status = code
             if 200 <= code < 300:
                 self._remember(request_id)
                 self.events.emit("bridge.sent", request_id=request_id)
@@ -328,6 +380,7 @@ class BotBridge:
         except Exception:
             pass
         self._mark_read(request_id)
+        self._last_answered_by = _public_bot_name(row.get("answered_by"))
         answer = str(row.get("answer") or "").strip()
         if self.deliver and answer:
             self.deliver_text(answer, naturally=True, chime=True)
