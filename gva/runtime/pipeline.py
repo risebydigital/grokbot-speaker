@@ -249,9 +249,18 @@ class VoiceAssistant:
         if outcome.response_hash:
             fields["response_hash"] = outcome.response_hash
         self.events.emit("turn.completed", level="info" if outcome.status == "ok" else "error", **fields)
+        audio_ms = 0
+        underruns = 0
+        consume_ms = getattr(self.sink, "consume_audio_ms", None)
+        if callable(consume_ms):
+            audio_ms = int(consume_ms())
+        consume_underruns = getattr(self.sink, "consume_underruns", None)
+        if callable(consume_underruns):
+            underruns = int(consume_underruns())
         self.events.emit(
             "playback.completed",
-            audio_ms=0,
+            audio_ms=audio_ms,
+            underruns=underruns,
             interrupted=outcome.interrupted,
         )
         self.session_touched = time.monotonic()

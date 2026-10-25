@@ -1,6 +1,8 @@
 [Unit]
 Description=Grok Voice Assistant Supabase sync
 After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,11 +12,10 @@ WorkingDirectory=/opt/gva/app
 Environment=GVA_CONFIG=/etc/gva/config.yaml
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=/etc/gva/gva.env
+# Exits 0 when Supabase is unset, so a blank URL does not restart in a loop.
 ExecStart=/opt/gva/venv/bin/gva sync run
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=300
-StartLimitBurst=5
 MemoryMax=512M
 NoNewPrivileges=true
 ProtectSystem=strict

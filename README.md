@@ -65,10 +65,28 @@ sudoedit /etc/gva/gva.env
 sudo gva doctor
 gva audio devices
 gva test-audio
-sudo systemctl enable --now gva-voice.service gva-backend.service gva-sync.service gva-retention.timer gva-backup.timer
+sudo systemctl enable --now gva-voice.service gva-backend.service gva-retention.timer gva-backup.timer
 ```
 
+`gva doctor`, `gva audio devices`, and `gva test-audio` do not need root. `gva doctor` reads `/etc/gva/gva.env` when the file is readable (root, or the `gva` user). It never prints secret values. If the file cannot be read it says so, instead of claiming the keys are missing.
+
+Enable `gva-sync.service` only after `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` are set. The installer leaves it disabled until then. A blank URL makes `gva sync run` log that sync is idle and exit 0, so systemd does not restart it in a loop.
+
 `gva doctor` must succeed before the voice service is enabled. A failed doctor run still installs the units, and leaves them stopped.
+
+## Updating
+
+On the Pi the app checkout is owned by `gva`, and neither root nor `gva` has GitHub credentials. Fetch in the operator checkout first, then update:
+
+```bash
+cd ~/milo
+git pull --ff-only
+sudo bash deploy/update.sh
+gva doctor
+gva test-audio
+```
+
+`deploy/update.sh` sets `safe.directory` so git does not refuse the `gva`-owned tree. When `/home/$SUDO_USER/milo` exists it fast-forwards `/opt/gva/app` from that checkout (`git pull --ff-only ... main`). Otherwise it pulls `origin`. It restarts only units that are enabled. Re-running `sudo bash deploy/install.sh` updates an existing checkout the same way, instead of leaving the old tree in place.
 
 ## Audio test
 
@@ -94,6 +112,8 @@ Non-secret settings live in `/etc/gva/config.yaml`, seeded from [`config/config.
 | `audio.input_device` | `AIRHUG` | Substring of the capture device |
 | `audio.output_device` | empty | Empty selects USB, then the 3.5 mm jack |
 | `audio.capture_rate` | `48000` | Microphone rate |
+| `audio.playback_prebuffer_ms` | `200` | Audio queued before the speaker leaves silence |
+| `audio.playback_latency` | `high` | PortAudio latency hint (`high` or `low`) |
 | `wake.model` | `hey_jarvis` | openWakeWord model name, or a path to ONNX |
 | `wake.phrase` | `hey jarvis` | Phrase you say |
 | `wake.threshold` | `0.6` | Score that counts as a hit |
@@ -106,7 +126,7 @@ Change an allow-listed key with `gva config set <key> <value>`. Secrets are reje
 
 ### Choppy playback
 
-Each realtime audio delta used to call `play()` on its own, which reopened the device and stuttered. Milo now keeps one output stream open, pre-buffers about 100 ms, and lets a separate task pull PCM off a queue.
+Realtime audio arrives as short 24 kHz mono deltas. The Sanyun card only accepts 48 kHz stereo, so each delta is resampled. Milo keeps one callback stream open for the whole reply (`latency` `high` by default) and resamples with a filter that remembers its state, so the joins do not click. Playback waits until about 200 ms is buffered (`audio.playback_prebuffer_ms`). If the buffer runs dry the callback writes silence and counts an underrun. It does not close and reopen the device. `playback.completed` records `audio_ms` and `underruns`. `stt.completed` records `audio_ms` and `duration_ms`.
 
 If a reply is still uneven:
 
@@ -127,7 +147,7 @@ Raspberry Pi OS Trixie ships Python 3.13. `openwakeword` depends on `tflite-runt
 
 ### Speaker format
 
-`gva test-audio` used to open the output stream at the source rate in mono (16 kHz for a local tone, 24 kHz for realtime). The Sanyun card rejects that with PortAudio error -9997 (invalid sample rate). The sink now asks the device what it will accept: the source rate first, then `default_samplerate` (48000 on this speaker), mono first and stereo if mono is refused. Playback is resampled and, when needed, duplicated to both channels before it enters the jitter buffer, so the buffer matches the open stream.
+`gva test-audio` used to open the output stream at the source rate in mono (16 kHz for a local tone, 24 kHz for realtime). The Sanyun card rejects that with PortAudio error -9997 (invalid sample rate). The sink now asks the device what it will accept: the source rate first, then `default_samplerate` (48000 on this speaker), mono first and stereo if mono is refused. Playback is resampled with state carried across chunks and, when needed, duplicated to both channels before it enters the jitter buffer, so the buffer matches the open stream.
 
 The microphone path does the same in reverse. The AIRHUG is opened at a rate and channel count it supports (native 48 kHz) and the capture callback downmixes to mono and resamples to the rate the pipeline asked for.
 
@@ -137,7 +157,7 @@ A tone from `speaker-test -D plughw:<card>,<device>` means the hardware is fine.
 
 `/etc/gva/config.yaml` has no secrets. It is mode `0644`, and `/etc/gva` is mode `0755`, so a normal login can run `gva test-audio`. `/etc/gva/gva.env` stays mode `0600`, owner `gva`. If a config file cannot be read, the command says so and continues with the bundled example instead of raising `PermissionError`.
 
-`/usr/share/gva/wake`, `voices`, and `fallback` are mode `0755` so the models can be read. Logs and the SQLite database stay private to `gva`.
+Logs and the database go to `/var/lib/gva` when that directory is writable, and otherwise to `~/.local/state/gva`. They are never created inside the application directory. `/usr/share/gva/wake`, `voices`, and `fallback` are mode `0755` so the models can be read. Logs and the SQLite database stay private to `gva` when the service is running.
 
 ### Headless ALSA
 

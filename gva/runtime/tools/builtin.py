@@ -173,7 +173,8 @@ def set_device_level(args: dict[str, Any], ctx) -> dict[str, Any]:
 
 
 def get_calendar_events(args: dict[str, Any], ctx) -> dict[str, Any]:
-    return {"ok": True, "range": args.get("range") or "today", "events": [], "note": "No calendar is connected."}
+    """No calendar backend is configured. Say so. Do not invent events."""
+    return {"ok": False, "error": "calendar not connected", "range": args.get("range") or "today"}
 
 
 def get_time(args: dict[str, Any], ctx) -> dict[str, Any]:

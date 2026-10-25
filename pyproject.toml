@@ -50,7 +50,7 @@ gva = "gva.cli:main"
 include = ["gva*"]
 
 [tool.setuptools.package-data]
-gva = ["telemetry/event-1.0.0.json", "prompts/*.txt"]
+gva = ["telemetry/event-1.0.0.json", "prompts/*.txt", "assets/*.wav"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

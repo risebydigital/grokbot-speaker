@@ -461,8 +461,8 @@ def sync_run() -> None:
     cfg = _cfg()
     client = client_from_env()
     if client is None:
-        typer.echo("Supabase is not configured", err=True)
-        raise typer.Exit(1)
+        typer.echo("Supabase is not configured. Sync is idle.")
+        raise typer.Exit(0)
     from gva.backend.sync_supabase import run_forever
 
     store = _store(cfg)

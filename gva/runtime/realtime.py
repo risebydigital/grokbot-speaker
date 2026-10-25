@@ -27,7 +27,7 @@ from typing import Any
 
 from gva.config import Config, env_value
 from gva.ids import new_ulid, utc_now_ms
-from gva.runtime.audio import resample_pcm
+from gva.runtime.audio import FALLBACK_PHRASE, play_fallback_phrase, resample_pcm
 from gva.runtime.conversation import render_system
 from gva.runtime.textutil import is_stop_phrase
 from gva.telemetry.events import EventLog
@@ -89,6 +89,13 @@ class RealtimeProtocol:
         self._pending_tools = 0
         self._turn_open = False
         self._response_id: str | None = None
+        self._response_pcm_bytes = 0
+        self._stt_bytes = 0
+        self._stt_started: float | None = None
+        # A tool response often ends with no audio. The spoken reply is the next one.
+        self._defer_silence_fallback = False
+        self._need_response_create = False
+        self.fallback_player = None
         self.session_id = new_ulid()
 
     def session_update(self) -> dict[str, Any]:
@@ -122,6 +129,9 @@ class RealtimeProtocol:
         pcm = resample_pcm(pcm_capture_rate, self.cfg.audio.capture_rate, voice_rate)
         if len(pcm) < 2:
             return None
+        if self._stt_started is None:
+            self._stt_started = time.monotonic()
+        self._stt_bytes += len(pcm)
         return {"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode("ascii")}
 
     def on_event(self, event: dict[str, Any]) -> list[dict[str, Any]]:
@@ -158,12 +168,21 @@ class RealtimeProtocol:
         if etype == "response.created":
             self.note_activity()
             self._turn_open = True
+            self._response_pcm_bytes = 0
             self._response_id = event.get("response", {}).get("id") or event.get("response_id")
             return []
         if etype == "response.done":
             self.note_activity()
             self.speaking = False
+            # response.create while a response is still active is rejected, and the
+            # model then says nothing. Send it only after this response has finished.
+            owe_reply = self._need_response_create
+            self._need_response_create = False
+            if owe_reply:
+                self._defer_silence_fallback = True
             self._finish_turn(event, status="ok", intent=None)
+            if owe_reply:
+                return [{"type": "response.create"}]
             return []
         if etype == "response.function_call_arguments.done":
             self.note_activity()
@@ -204,6 +223,7 @@ class RealtimeProtocol:
     def enqueue_pcm(self, pcm: bytes) -> None:
         if len(pcm) < 2:
             return
+        self._response_pcm_bytes += len(pcm) - (len(pcm) % 2)
         self.speaking = True
         try:
             self.playback.put_nowait(pcm)
@@ -281,7 +301,9 @@ class RealtimeProtocol:
                 duration_ms=outcome.duration_ms,
                 result_bytes=len(json.dumps(outcome.result)),
             )
-        # function_call_output is not a billed text message.
+        # Hand the result back now. response.create waits for response.done so the
+        # server is not asked to speak while this response is still open.
+        self._need_response_create = True
         return [
             {
                 "type": "conversation.item.create",
@@ -291,14 +313,29 @@ class RealtimeProtocol:
                     "output": json.dumps(outcome.result)[:4096],
                 },
             },
-            {"type": "response.create"},
         ]
 
     def _finish_turn(self, event: dict[str, Any], status: str, intent: str | None) -> None:
-        if self._turn_open is False and not self._user_text and not self._assistant and status == "ok":
+        rate = self.cfg.conversation.realtime.sample_rate
+        audio_ms = _pcm_ms(self._response_pcm_bytes, rate)
+        defer_fallback = self._defer_silence_fallback
+        self._defer_silence_fallback = False
+        if (
+            self._turn_open is False
+            and not self._user_text
+            and not self._assistant
+            and status == "ok"
+            and audio_ms == 0
+        ):
             usage = _usage(event)
             self._account(usage, event)
             return
+        fallback = False
+        if status == "ok" and audio_ms == 0 and not defer_fallback:
+            extra = self._speak_fallback()
+            if extra:
+                fallback = True
+                audio_ms += extra
         usage = _usage(event)
         cost = self._account(usage, event)
         user = self._user_text
@@ -326,19 +363,50 @@ class RealtimeProtocol:
             "total_ms": 0,
             "tokens_total": 0,
             "cost_usd": cost,
-            "fallback_spoken": False,
+            "fallback_spoken": fallback,
             "started_at": utc_now_ms(),
             "model": self.cfg.conversation.realtime.model,
         }
         if reply_hash:
             fields["response_hash"] = reply_hash
         self.events.emit("turn.completed", level="info" if status == "ok" else "warning", **fields)
-        self.events.emit("playback.completed", audio_ms=0, interrupted=status == "cancelled")
+        self.events.emit(
+            "playback.completed",
+            audio_ms=audio_ms,
+            underruns=self._take_underruns(),
+            interrupted=status == "cancelled",
+        )
+        self._response_pcm_bytes = 0
         self._user_text = ""
         self._assistant = []
         self._tools = []
         self._turn_open = False
         self.events.ctx.turn_id = None
+
+    def _speak_fallback(self) -> int:
+        player = self.fallback_player or play_fallback_phrase
+        try:
+            result = player(self.sink, self.cfg, FALLBACK_PHRASE)
+        except Exception:
+            return 0
+        if isinstance(result, bool):
+            return 1 if result else 0
+        try:
+            return max(0, int(result))
+        except (TypeError, ValueError):
+            return 0
+
+    def _take_underruns(self) -> int:
+        consume = getattr(self.sink, "consume_underruns", None)
+        if callable(consume):
+            try:
+                return max(0, int(consume()))
+            except Exception:
+                return 0
+        try:
+            return max(0, int(getattr(self.sink, "underruns", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def _account(self, usage: dict[str, Any] | None, event: dict[str, Any]) -> float | None:
         price = self.cfg.conversation.realtime.audio_usd_per_minute
@@ -373,19 +441,33 @@ class RealtimeProtocol:
 
     def _emit_stt(self, text: str) -> None:
         shown, digest, _, _ = _redacted(text, self.cfg)
+        rate = self.cfg.conversation.realtime.sample_rate
+        heard = _pcm_ms(self._stt_bytes, rate)
+        if self._stt_started is None:
+            elapsed = 0
+        else:
+            elapsed = max(0, int((time.monotonic() - self._stt_started) * 1000))
+        self._stt_bytes = 0
+        self._stt_started = None
         self.events.ctx.session_id = self.session_id
         self.events.emit(
             "stt.completed",
             engine="xai",
             model=self.cfg.conversation.realtime.model,
-            audio_ms=0,
-            duration_ms=0,
+            audio_ms=heard,
+            duration_ms=elapsed,
             confidence=None,
             language="en",
             prompt_redacted=shown,
             prompt_hash=digest,
             rejected_reason=None,
         )
+
+
+def _pcm_ms(nbytes: int, rate: int) -> int:
+    if rate <= 0 or nbytes < 2:
+        return 0
+    return int(nbytes / 2 / rate * 1000)
 
 
 def _usage(event: dict[str, Any]) -> dict[str, Any] | None:

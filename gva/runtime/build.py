@@ -30,7 +30,12 @@ def build_assistant(cfg: Config):
 def build_realtime(cfg: Config) -> RealtimeAssistant:
     store, events = _telemetry(cfg)
     capture = _capture(cfg, events, cfg.audio.capture_rate)
-    sink = SoundDeviceSink(_output_index(cfg), cfg.conversation.realtime.sample_rate)
+    sink = SoundDeviceSink(
+        _output_index(cfg),
+        cfg.conversation.realtime.sample_rate,
+        prebuffer_ms=cfg.audio.playback_prebuffer_ms,
+        latency=cfg.audio.playback_latency,
+    )
     wake = _wake(cfg)
     tools = load_registry(cfg, store)
     return RealtimeAssistant(cfg, store, events, capture, sink, wake, tools)
@@ -40,7 +45,12 @@ def build_local(cfg: Config) -> VoiceAssistant:
     """Whisper, Grok chat, and Piper. Capture stays at the 16 kHz the cascade expects."""
     store, events = _telemetry(cfg)
     capture = _capture(cfg, events, cfg.audio.sample_rate)
-    sink = SoundDeviceSink(_output_index(cfg), cfg.audio.sample_rate)
+    sink = SoundDeviceSink(
+        _output_index(cfg),
+        cfg.audio.sample_rate,
+        prebuffer_ms=cfg.audio.playback_prebuffer_ms,
+        latency=cfg.audio.playback_latency,
+    )
     wake = _wake(cfg)
     energy = EnergyVad(cfg.vad.energy_threshold)
     vad = (
