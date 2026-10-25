@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square" alt="Python 3.11 or newer">
-  <img src="https://img.shields.io/badge/Raspberry%20Pi-4-C51A4A?style=flat-square" alt="Raspberry Pi 4">
+  <img src="https://img.shields.io/badge/python-3.11%2B-052A48?style=flat-square" alt="Python 3.11 or newer">
+  <img src="https://img.shields.io/badge/Raspberry%20Pi-4-00A897?style=flat-square" alt="Raspberry Pi 4">
   <img src="https://img.shields.io/badge/licence-private-052A48?style=flat-square" alt="Private licence">
 </p>
 

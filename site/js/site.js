@@ -11,12 +11,12 @@
   var PARTS = [
     {
       you: "\u201cMilo, what are you?\u201d",
-      milo: "I'm Milo, a home-made smart speaker that lives on your bookshelf. Say my name, ask me something, and I'll talk it through with you."
+      milo: "I’m Milo, a home-made smart speaker that lives on your bookshelf. Say my name, ask me something, and I’ll talk it through with you."
     },
     {
       /* PLACEHOLDER awaiting Adam: demo conversation part 2. */
       you: "\u201cMilo, what can you do?\u201d",
-      milo: "I listen for my name, then we talk. I answer out loud through the bookshelf speakers, and the Voice Ops Dashboard lets the team see how I'm getting on."
+      milo: "I listen for my name, then we talk. I answer out loud through the bookshelf speakers, and the Voice Ops Dashboard lets the team see how I’m getting on."
     },
     {
       /* PLACEHOLDER awaiting Adam: demo conversation part 3. */
@@ -28,7 +28,7 @@
   /* credits is a real command. It is named in the section sentence and omitted
      from this help table so the panel matches the approved preview. */
   var COMMANDS = {
-    help: "<span class=\"k\">Available commands</span>\n  <span class=\"c\">help</span>          <span class=\"d\">List commands</span>\n  <span class=\"c\">about</span>         <span class=\"d\">What Milo is</span>\n  <span class=\"c\">hardware</span>      <span class=\"d\">The parts list</span>\n  <span class=\"c\">architecture</span>  <span class=\"d\">How a conversation flows</span>\n  <span class=\"c\">install</span>       <span class=\"d\">Getting set up</span>\n  <span class=\"c\">roadmap</span>       <span class=\"d\">What's next</span>\n",
+    help: "<span class=\"k\">Available commands</span>\n  <span class=\"c\">help</span>          <span class=\"d\">List commands</span>\n  <span class=\"c\">about</span>         <span class=\"d\">What Milo is</span>\n  <span class=\"c\">hardware</span>      <span class=\"d\">The parts list</span>\n  <span class=\"c\">architecture</span>  <span class=\"d\">How a conversation flows</span>\n  <span class=\"c\">install</span>       <span class=\"d\">Getting set up</span>\n  <span class=\"c\">roadmap</span>       <span class=\"d\">What’s next</span>\n",
     about: "<span class=\"k\">Milo</span>  <span class=\"d\">an RBD internal project</span>\nA home-made voice smart speaker. Say the wake word\n\"Milo\", then talk to it like a voice chat assistant.\nA Voice Ops Dashboard sits alongside the speaker.\n",
     hardware: "<span class=\"k\">Parts list</span>\n  [1] Single-board computer <span class=\"d\">(Pi 4)</span>\n  [2] USB microphone\n  [3] Wired bookshelf speakers <span class=\"d\">(a pair)</span>\n<span class=\"d\">Type 'architecture' to see how they talk to each other.</span>\n",
     architecture: "<span class=\"k\">How a conversation flows</span>\n  USB mic\n   \u2514\u2500\u25b6 wake word \"Milo\"\n        \u2514\u2500\u25b6 Voice AI\n             \u2514\u2500\u25b6 speakers\n  <span class=\"d\">Voice Ops Dashboard keeps watch</span>\n",
