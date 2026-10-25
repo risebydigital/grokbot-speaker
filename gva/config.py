@@ -33,6 +33,11 @@ class AudioConfig(BaseModel):
     chunk_ms: int = 80
     aec_enabled: bool = True
     aec_delay_ms: int = 80
+    # How much device-rate audio to queue before the callback leaves silence.
+    # 200 ms sits in the 150-250 ms range that keeps a USB speaker from stuttering.
+    playback_prebuffer_ms: int = 200
+    # PortAudio hint. "high" suits the Sanyun USB card. "low" is the other allowed value.
+    playback_latency: Literal["high", "low"] = "high"
 
 
 class WakeConfig(BaseModel):
@@ -259,6 +264,58 @@ class Config(BaseModel):
     source_data: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
+ENV_FILE_STATUS = "unread"
+
+
+def _read_env(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def load_service_env(path: Path | None = None) -> str:
+    """Load /etc/gva/gva.env into the process when a variable is not already set.
+
+    Returns "loaded", "missing", or "unreadable". Values are never logged.
+    Blank lines and comments are ignored. A value already in the environment wins,
+    so a service EnvironmentFile is not overwritten by a second read.
+    """
+    global ENV_FILE_STATUS
+    if path is None:
+        override = os.environ.get("GVA_ENV_FILE")
+        path = Path(override) if override else Path("/etc/gva/gva.env")
+    try:
+        exists = path.is_file()
+    except OSError:
+        ENV_FILE_STATUS = "unreadable"
+        return ENV_FILE_STATUS
+    if not exists:
+        ENV_FILE_STATUS = "missing"
+        return ENV_FILE_STATUS
+    try:
+        text = _read_env(path)
+    except OSError:
+        ENV_FILE_STATUS = "unreadable"
+        return ENV_FILE_STATUS
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or not key.replace("_", "").isalnum() or key[0].isdigit():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        if key not in os.environ:
+            os.environ[key] = value
+    ENV_FILE_STATUS = "loaded"
+    return ENV_FILE_STATUS
+
+
 def env_value(name: str) -> str | None:
     """Return an environment variable, treating blank and placeholder values as unset."""
     raw = os.environ.get(name)
@@ -286,6 +343,7 @@ def _read_config_text(path: Path) -> tuple[str | None, str | None]:
 
 
 def load_config(path: Path | None = None) -> Config:
+    load_service_env()
     notes: list[str] = []
     if path is None:
         override = os.environ.get("GVA_CONFIG")

@@ -205,5 +205,11 @@ def test_install_scripts_fail_closed_and_use_onnx_wake():
     assert "chmod 600" in permissions
     assert "chmod 755 /etc/gva" in permissions
     assert "openwakeword>=" not in project
-    for script in ("deploy/install.sh", "deploy/update.sh", "deploy/voice-packages.sh", "deploy/permissions.sh"):
+    for script in (
+        "deploy/install.sh",
+        "deploy/update.sh",
+        "deploy/git-sync.sh",
+        "deploy/voice-packages.sh",
+        "deploy/permissions.sh",
+    ):
         subprocess.run(["bash", "-n", str(root / script)], check=True)

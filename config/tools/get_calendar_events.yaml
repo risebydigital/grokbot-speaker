@@ -1,7 +1,8 @@
 name: get_calendar_events
 description: >
-  Read the household calendar. Read at most three events aloud, soonest first.
-  If no calendar is connected, say so. Do not invent events.
+  No calendar is connected. Call this when asked about plans, meetings,
+  diaries, or reports that are due. The result is an error, calendar not
+  connected. Say that plainly in one sentence. Do not invent events.
 timeout_s: 5
 risk: low
 personal_data: true

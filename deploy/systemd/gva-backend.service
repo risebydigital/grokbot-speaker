@@ -1,6 +1,8 @@
 [Unit]
 Description=Grok Voice Assistant local API
 After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -13,8 +15,6 @@ EnvironmentFile=/etc/gva/gva.env
 ExecStart=/opt/gva/venv/bin/uvicorn gva.backend.app:app --host 127.0.0.1 --port 8080
 Restart=on-failure
 RestartSec=3
-StartLimitIntervalSec=120
-StartLimitBurst=5
 MemoryMax=512M
 NoNewPrivileges=true
 ProtectSystem=strict

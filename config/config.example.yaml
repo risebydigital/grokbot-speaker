@@ -23,6 +23,10 @@ audio:
   # Single-delay software echo attenuation. There is no hardware AEC on this kit.
   aec_enabled: true
   aec_delay_ms: 80
+  # Queue this much device-rate audio before the callback leaves silence.
+  playback_prebuffer_ms: 200
+  # PortAudio latency hint for the USB speaker. high or low.
+  playback_latency: high
 
 wake:
   engine: openwakeword

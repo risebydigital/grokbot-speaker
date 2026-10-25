@@ -14,6 +14,8 @@ fi
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 APP=/opt/gva/app
 VENV=/opt/gva/venv
+# shellcheck disable=SC1091
+source "$REPO/deploy/git-sync.sh"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -44,15 +46,16 @@ install -d -o gva -g gva -m 755 \
   /usr/share/gva/voices \
   /usr/share/gva/fallback
 
-if [[ "$REPO" != "$APP" ]]; then
+if [[ "$REPO" != "$APP" && ! -d "$APP/.git" ]]; then
   install -d /opt/gva
-  if [[ -d "$APP/.git" ]]; then
-    echo "Using the existing checkout at $APP"
-  else
-    rsync -a --delete --exclude .venv --exclude .gva "$REPO/" "$APP/"
-  fi
+  rsync -a --delete --exclude .venv --exclude .gva "$REPO/" "$APP/"
+elif [[ -d "$APP/.git" ]]; then
+  echo "Updating the existing checkout at $APP"
+  sync_app_checkout "$APP"
 fi
-chown -R gva:gva "$APP"
+if [[ -d "$APP" ]]; then
+  chown -R gva:gva "$APP"
+fi
 
 if [[ ! -x "$VENV/bin/python" ]]; then
   python3 -m venv "$VENV"
@@ -99,13 +102,19 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done < /etc/gva/gva.env
 
 if gva doctor; then
-  systemctl enable --now gva-voice.service gva-backend.service gva-sync.service gva-retention.timer gva-backup.timer
-  echo "Services enabled."
+  systemctl enable --now gva-voice.service gva-backend.service gva-retention.timer gva-backup.timer
+  if supabase_configured; then
+    systemctl enable --now gva-sync.service
+    echo "Services enabled, including Supabase sync."
+  else
+    echo "Supabase is not set, so gva-sync.service was not enabled."
+  fi
 else
   echo "Doctor failed, so systemd units were installed but not started."
   echo "After the env file is filled in:"
   echo "  sudo gva doctor"
-  echo "  sudo gva audio devices"
+  echo "  gva audio devices"
   echo "  sudo gva models download"
-  echo "  sudo systemctl enable --now gva-voice.service gva-backend.service gva-sync.service gva-retention.timer gva-backup.timer"
+  echo "  sudo systemctl enable --now gva-voice.service gva-backend.service gva-retention.timer gva-backup.timer"
+  echo "  Enable gva-sync.service only after SUPABASE_URL and SUPABASE_SERVICE_KEY are set."
 fi
