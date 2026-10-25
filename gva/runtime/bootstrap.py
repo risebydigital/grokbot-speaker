@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 
@@ -35,6 +36,45 @@ def _writable(path: Path) -> bool:
         return False
 
 
+# Import names, then the pip distribution name used in the doctor message.
+VOICE_MODULES = (
+    ("sounddevice", "sounddevice"),
+    ("onnxruntime", "onnxruntime"),
+    ("openwakeword", "openwakeword"),
+    ("faster_whisper", "faster-whisper"),
+    ("piper", "piper-tts"),
+    ("scipy", "scipy"),
+    ("sklearn", "scikit-learn"),
+    ("tqdm", "tqdm"),
+    ("requests", "requests"),
+)
+
+
+def voice_import_problems(find_spec=None) -> list[str]:
+    """Report voice packages that are not installed.
+
+    openwakeword is imported as ONNX only. A normal pip install of that package
+    also asks for tflite-runtime, which has no wheel for Python 3.13.
+    """
+    finder = find_spec or importlib.util.find_spec
+    missing: list[str] = []
+    for module, label in VOICE_MODULES:
+        try:
+            if finder(module) is None:
+                missing.append(label)
+        except Exception as exc:
+            missing.append(f"{label} ({exc.__class__.__name__})")
+    if not missing:
+        return []
+    names = ", ".join(missing)
+    return [
+        "Voice packages are not installed ("
+        + names
+        + "). Run: sudo bash deploy/install.sh. "
+        + "openwakeword is installed with --no-deps because tflite-runtime has no Python 3.13 wheel."
+    ]
+
+
 def doctor_checks(cfg: Config) -> tuple[list[str], list[str]]:
     """Return (problems, warnings). Problems should stop the voice service from starting."""
     problems: list[str] = []
@@ -64,4 +104,11 @@ def doctor_checks(cfg: Config) -> tuple[list[str], list[str]]:
     voice = Path(cfg.tts.model_dir) / f"{cfg.tts.voice}.onnx"
     if not voice.is_file():
         warnings.append(f"Piper voice not downloaded yet ({voice.name}). Run: gva models download")
+    problems.extend(voice_import_problems())
+    wake_dir = Path(cfg.wake.model_dir)
+    try:
+        if wake_dir.exists() and not os.access(wake_dir, os.R_OK | os.X_OK):
+            problems.append(f"{wake_dir} is not readable. It should be mode 0755.")
+    except OSError as exc:
+        problems.append(f"{wake_dir} is not readable ({exc.__class__.__name__}).")
     return problems, warnings

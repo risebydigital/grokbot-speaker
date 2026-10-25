@@ -250,11 +250,18 @@ def test_audio(seconds: float = typer.Option(2.0, "--seconds", help="How long th
         raise typer.Exit(1)
     name = next((row["name"] for row in rows if row.get("index") == index), str(index))
     rate = cfg.conversation.realtime.sample_rate if cfg.conversation.engine == "realtime" else cfg.audio.sample_rate
-    typer.echo(f"playing a {seconds:.1f}s tone on [{index}] {name} at {rate} Hz")
     sink = SoundDeviceSink(index, rate)
     try:
+        sink.prepare()
+        typer.echo(
+            f"playing a {seconds:.1f}s tone on [{index}] {name} "
+            f"(source {rate} Hz, device {sink.device_rate} Hz, {sink.channels} ch)"
+        )
         sink.write(tone(int(seconds * 1000), freq=440, amp=8000, sample_rate=rate))
         time.sleep(seconds + 0.4)
+    except Exception as exc:
+        typer.echo(f"playback failed: {exc.__class__.__name__}: {exc}", err=True)
+        raise typer.Exit(1) from exc
     finally:
         sink.close()
     typer.echo("done")
@@ -262,7 +269,7 @@ def test_audio(seconds: float = typer.Option(2.0, "--seconds", help="How long th
 
 @audio_app.command("devices")
 def audio_devices() -> None:
-    """List ALSA devices so the config substrings can be filled in."""
+    """List ALSA devices. This command does not read /etc/gva/config.yaml."""
     rows = list_devices()
     for row in rows:
         if row.get("error"):
@@ -349,14 +356,21 @@ def models_download() -> None:
     """Download hey_jarvis and the en_GB Piper voice. Needs a network."""
     cfg = _cfg()
     wake_dir = Path(cfg.wake.model_dir)
-    wake_dir.mkdir(parents=True, exist_ok=True)
     try:
-        import openwakeword
+        wake_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        typer.echo(f"cannot create {wake_dir}: {exc.__class__.__name__}", err=True)
+        raise typer.Exit(1) from exc
+    try:
+        from gva.runtime.wake import download_onnx_models
 
-        openwakeword.utils.download_models(model_names=["hey_jarvis"], target_directory=str(wake_dir))
-        typer.echo(f"wake models in {wake_dir}")
+        spec = cfg.wake.model
+        names = [] if spec.endswith(".onnx") else [spec]
+        download_onnx_models(names, str(wake_dir))
+        typer.echo(f"ONNX wake models in {wake_dir}")
     except Exception as exc:
-        typer.echo(f"wake download failed: {exc.__class__.__name__}", err=True)
+        typer.echo(f"wake download failed: {exc.__class__.__name__}: {exc}", err=True)
+        raise typer.Exit(1) from exc
     voice_dir = Path(cfg.tts.model_dir)
     voice_dir.mkdir(parents=True, exist_ok=True)
     voice = cfg.tts.voice

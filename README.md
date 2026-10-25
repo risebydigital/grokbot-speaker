@@ -38,7 +38,7 @@ Capture is 48 kHz from the microphone. Wake-word scoring uses 16 kHz. The realti
 | --- | --- |
 | Raspberry Pi 4, 4 GB | Runs the voice loop under systemd. PipeWire is the audio server. |
 | AIRHUG USB microphone | Capture. Two inputs, native 48 kHz, no hardware echo cancellation. |
-| Sanyun SW208 | Active bookshelf speakers. USB into a Pi USB-A port. |
+| Sanyun SW208 | Active bookshelf speakers. USB into a Pi USB-A port. The card used here accepts S16_LE, 2 channels, 48000 Hz only. |
 
 The Pi 4 USB-C socket is power only. Do not put the speaker there. Bluetooth is not on the default playback path. If no USB speaker is present, Milo uses the 3.5 mm headphone jack.
 
@@ -116,6 +116,41 @@ If a reply is still uneven:
 
 After every session Milo drops the openWakeWord model and loads a fresh one, requires two frames over the threshold, flushes the capture queue, and waits out `wake.cooldown_seconds` (3 seconds). That is what stopped the phrase from tripping again on its own echo. Do not lower patience to 1 on this microphone.
 
+### Python 3.13 and the wake word
+
+Raspberry Pi OS Trixie ships Python 3.13. `openwakeword` depends on `tflite-runtime` on Linux, and that project has no wheel for 3.13, so `pip install -e ".[voice]"` fails. `deploy/install.sh` does not ignore that failure. It installs faster-whisper, piper-tts, sounddevice, onnxruntime, scipy, scikit-learn, tqdm, and requests, then installs `openwakeword` with `--no-deps`. Milo loads ONNX models only (`inference_framework="onnx"`), including the melspectrogram and embedding nets.
+
+`gva doctor` reports any of those imports that are missing. `gva models download` fetches the ONNX files, not the TFLite ones.
+
+### Speaker format
+
+`gva test-audio` used to open the output stream at the source rate in mono (16 kHz for a local tone, 24 kHz for realtime). The Sanyun card rejects that with PortAudio error -9997 (invalid sample rate). The sink now asks the device what it will accept: the source rate first, then `default_samplerate` (48000 on this speaker), mono first and stereo if mono is refused. Playback is resampled and, when needed, duplicated to both channels before it enters the jitter buffer, so the buffer matches the open stream.
+
+The microphone path does the same in reverse. The AIRHUG is opened at a rate and channel count it supports (native 48 kHz) and the capture callback downmixes to mono and resamples to the rate the pipeline asked for.
+
+A tone from `speaker-test -D plughw:<card>,<device>` means the hardware is fine. If `gva test-audio` still fails, the line it prints (`device ... Hz, ... ch`) is the format it actually opened.
+
+### Config file permissions
+
+`/etc/gva/config.yaml` has no secrets. It is mode `0644`, and `/etc/gva` is mode `0755`, so a normal login can run `gva test-audio`. `/etc/gva/gva.env` stays mode `0600`, owner `gva`. If a config file cannot be read, the command says so and continues with the bundled example instead of raising `PermissionError`.
+
+`/usr/share/gva/wake`, `voices`, and `fallback` are mode `0755` so the models can be read. Logs and the SQLite database stay private to `gva`.
+
+### Headless ALSA
+
+`gva-voice.service` runs as user `gva`, group `gva`, with supplementary group `audio`. That is what lets it open `/dev/snd` without a logged-in seat. There is no PipeWire or PulseAudio session for that user, and the service does not use one. PortAudio opens the ALSA hw device (the name looks like `USB2.0 Device: Audio (hw:4,0)`). PipeWire and Pulse device names are skipped so a desktop session graph is not selected by mistake.
+
+`PrivateDevices` is left unset, so `/dev/snd` is visible inside the sandbox. `ProtectSystem=strict` does not hide device nodes. If a logged-in PipeWire process already holds the USB card, the service gets "device or resource busy". On a headless Pi nothing else grabs the card. Check with:
+
+```bash
+aplay -l
+speaker-test -D plughw:<card>,<device> -c 2 -r 48000 -f 440 -t sine -l 1
+gva audio devices
+gva test-audio
+```
+
+`gva audio devices` does not read `/etc/gva/config.yaml`.
+
 ### Finding the audio device
 
 ```bash
@@ -156,4 +191,4 @@ pytest
 python tools/secret_scan.py
 ```
 
-Voice extras (sounddevice, openWakeWord, faster-whisper, Piper) are optional and are installed on the Pi by `deploy/install.sh`. Tests do not call xAI and do not need a microphone.
+On the Pi, `deploy/install.sh` installs the voice packages. Do not `pip install openwakeword` on its own: on Python 3.13 that pulls `tflite-runtime`, which has no wheel. Tests do not call xAI and do not need a microphone.
