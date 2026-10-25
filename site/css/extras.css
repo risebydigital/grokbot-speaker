@@ -1,0 +1,183 @@
+/* Interaction, motion and accessibility on top of the approved reference CSS.
+   Glow stays in the SVG: stepped solid tints, no opacity on teal. */
+
+html { scroll-behavior: smooth; }
+
+@font-face {
+  font-family: Roboto;
+  font-style: normal;
+  font-weight: 300;
+  font-display: swap;
+  src: url("../assets/fonts/roboto-300.woff2") format("woff2");
+}
+@font-face {
+  font-family: Roboto;
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../assets/fonts/roboto-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: Roboto;
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("../assets/fonts/roboto-500.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Roboto Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../assets/fonts/roboto-mono-400.woff2") format("woff2");
+}
+
+.skip {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  z-index: 20;
+  transform: translateY(-160%);
+  background: #00A897;
+  color: #fff;
+  font-weight: 500;
+  padding: 10px 16px;
+  border-radius: 6px;
+}
+.skip:focus {
+  transform: none;
+  outline: 2px solid #fff;
+  outline-offset: 3px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+a { color: inherit; }
+.logo-link, .sig { text-decoration: none; }
+.logo-link { display: inline-flex; align-items: center; line-height: 0; }
+.rnav nav a { text-decoration: none; }
+.sig:hover { text-decoration: underline; }
+.rnav nav a:hover { color: #00A897; }
+
+button.btn { appearance: none; background: transparent; }
+button.orb {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  appearance: none;
+  color: inherit;
+}
+button.chip {
+  margin: 0;
+  cursor: pointer;
+  font-family: "Roboto Mono", ui-monospace, monospace;
+  color: #fff;
+}
+.btn.primary:hover { background: #018F87; border-color: #018F87; }
+
+:focus-visible {
+  outline: 2px solid #052A48;
+  outline-offset: 3px;
+}
+.navy :focus-visible,
+.rfoot :focus-visible {
+  outline-color: #00A897;
+}
+.btn.primary:focus-visible,
+.chip.on:focus-visible,
+.skip:focus-visible {
+  outline-color: #fff;
+}
+
+#main, #project, #demo, #built, #hardware, #terminal {
+  scroll-margin-top: 16px;
+}
+
+.term-body { white-space: normal; }
+#term-log {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.term-form {
+  display: block;
+  margin: 0;
+  white-space: pre-wrap;
+}
+.term-field {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  vertical-align: bottom;
+}
+.term-input {
+  width: 0;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #fff;
+  font: inherit;
+  line-height: inherit;
+  caret-color: transparent;
+  color-scheme: dark;
+  -webkit-text-fill-color: #fff;
+}
+.term-input:focus,
+.term-input:focus-visible { outline: none; }
+.term:focus-within {
+  outline: 2px solid #00A897;
+  outline-offset: 3px;
+}
+
+/* Architecture: dashes travel. Hardware: cards settle in. Orb rings breathe while playing.
+   Solid fills only, no opacity. */
+@media (prefers-reduced-motion: no-preference) {
+  .flow { animation: milo-flow 1.15s linear infinite; }
+  @keyframes milo-flow { to { stroke-dashoffset: -13px; } }
+  .hw-card { animation: milo-hw 0.6s ease both; }
+  .hw-card:nth-child(2) { animation-delay: 0.08s; }
+  .hw-card:nth-child(3) { animation-delay: 0.16s; }
+  @keyframes milo-hw {
+    from { transform: translateY(12px); }
+    to { transform: translateY(0); }
+  }
+  body[data-playing="1"] .glow-talk circle,
+  body[data-playing="1"] .ring-talk circle {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: milo-pulse 3.2s ease-in-out infinite;
+  }
+  body[data-playing="1"] .glow-talk circle:nth-child(2) { animation-delay: 0.12s; }
+  body[data-playing="1"] .glow-talk circle:nth-child(3) { animation-delay: 0.24s; }
+  body[data-playing="1"] .glow-talk circle:nth-child(4) { animation-delay: 0.36s; }
+  body[data-playing="1"] .glow-talk circle:nth-child(5) { animation-delay: 0.48s; }
+  body[data-playing="1"] .glow-talk circle:nth-child(6) { animation-delay: 0.6s; }
+  body[data-playing="1"] .ring-talk circle:nth-child(1) { animation-delay: 0.2s; }
+  body[data-playing="1"] .ring-talk circle:nth-child(2) { animation-delay: 0.4s; }
+  body[data-playing="1"] .ring-talk circle:nth-child(3) { animation-delay: 0.6s; }
+  @keyframes milo-pulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.035); }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="Milo, a Grok Voice speaker by Rise By Digital" width="100%">
+  <picture>
+    <source srcset="docs/assets/banner.svg" type="image/svg+xml">
+    <img src="docs/assets/banner.png" srcset="docs/assets/banner.png 1x, docs/assets/banner@2x.png 2x" alt="Milo. Your voice assistant on the bookshelf." width="100%">
+  </picture>
 </p>
 
 <p align="center">
