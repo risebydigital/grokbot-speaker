@@ -1,11 +1,20 @@
-"""Wake-word scoring. openWakeWord has no Milo model; the default phrase is hey jarvis."""
+"""Wake-word scoring. openWakeWord has no Milo model; the default phrase is hey jarvis.
+
+Models are ONNX. tflite-runtime has no wheel for Python 3.13, so this process
+never asks openWakeWord for the TFLite interpreter.
+"""
 
 from __future__ import annotations
 
 import time
+import urllib.request
 from pathlib import Path
+from typing import Any, Callable
 
 from gva.runtime.audio import rms
+
+# openWakeWord's own default is tflite. Milo always passes this instead.
+INFERENCE_FRAMEWORK = "onnx"
 
 
 class ThresholdWake:
@@ -54,6 +63,104 @@ class EnergyWake:
         self.logic.reset_refractory()
 
 
+def onnx_model_url(url: str) -> str:
+    """Rewrite a published model URL so the download is the ONNX file."""
+    if url.endswith(".tflite"):
+        return url[: -len(".tflite")] + ".onnx"
+    return url
+
+
+def onnx_download_urls(
+    model_names: list[str] | None,
+    feature_models: dict[str, Any],
+    vad_models: dict[str, Any],
+    models: dict[str, Any],
+) -> list[str]:
+    """Feature, VAD, and requested wake models. Every URL ends in .onnx.
+
+    `None` downloads every classifier. An empty list downloads only the
+    melspectrogram, embedding, and Silero files.
+    """
+    urls: list[str] = []
+
+    def add(url: str) -> None:
+        rewritten = onnx_model_url(str(url))
+        if not rewritten.endswith(".onnx"):
+            raise ValueError(f"refusing a non-ONNX model url: {url}")
+        if rewritten not in urls:
+            urls.append(rewritten)
+
+    for table in (feature_models, vad_models):
+        for item in table.values():
+            add(item["download_url"])
+    if model_names is None:
+        chosen = list(models.values())
+    else:
+        chosen = []
+        for name in model_names:
+            stem = Path(name).name
+            if not stem or stem.endswith(".onnx") or "/" in name or name.startswith("."):
+                continue
+            for key, item in models.items():
+                filename = str(item["download_url"]).rsplit("/", 1)[-1]
+                onnx_name = filename.replace(".tflite", ".onnx")
+                if stem == key or stem in filename or stem in onnx_name:
+                    chosen.append(item)
+                    break
+    for item in chosen:
+        add(item["download_url"])
+    return urls
+
+
+def onnx_runtime_kwargs(model_paths: list[str], model_dir: Path) -> dict[str, Any]:
+    """Arguments for openwakeword.model.Model. Always ONNX, including the feature nets."""
+    directory = Path(model_dir)
+    return {
+        "wakeword_models": model_paths,
+        "inference_framework": INFERENCE_FRAMEWORK,
+        "melspec_model_path": str(directory / "melspectrogram.onnx"),
+        "embedding_model_path": str(directory / "embedding_model.onnx"),
+    }
+
+
+def download_onnx_models(
+    model_names: list[str] | None,
+    target_directory: str,
+    fetch: Callable[[str, Path], None] | None = None,
+    catalog: Any | None = None,
+) -> list[Path]:
+    """Download ONNX wake models into `target_directory`. Existing files are left in place."""
+    directory = Path(target_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    if catalog is None:
+        import openwakeword
+
+        catalog = openwakeword
+    urls = onnx_download_urls(model_names, catalog.FEATURE_MODELS, catalog.VAD_MODELS, catalog.MODELS)
+    saved: list[Path] = []
+    for url in urls:
+        dest = directory / url.rsplit("/", 1)[-1]
+        saved.append(dest)
+        if dest.is_file() and dest.stat().st_size > 0:
+            continue
+        if fetch is None:
+            _fetch_url(url, dest)
+        else:
+            fetch(url, dest)
+    return saved
+
+
+def _fetch_url(url: str, dest: Path) -> None:
+    temporary = dest.with_suffix(dest.suffix + ".part")
+    try:
+        urllib.request.urlretrieve(url, temporary)
+        temporary.replace(dest)
+    except Exception:
+        if temporary.exists():
+            temporary.unlink()
+        raise
+
+
 class OpenWakeWordEngine:
     """Scores 80 ms frames. `model` is a pretrained name (hey_jarvis) or a path to an ONNX file."""
 
@@ -94,24 +201,23 @@ class OpenWakeWordEngine:
     def _load(self):
         if self._model is not None:
             return self._model
-        import openwakeword
         from openwakeword.model import Model
 
         _force_cpu_provider()
 
         path = Path(self.model_spec)
+        download_onnx_models([] if path.is_file() else [self.model_spec], str(self.model_dir))
         if path.is_file():
             models = [str(path)]
             self.model_name = path.name
         else:
-            self.model_dir.mkdir(parents=True, exist_ok=True)
-            openwakeword.utils.download_models(
-                model_names=[self.model_spec],
-                target_directory=str(self.model_dir),
-            )
             matches = sorted(self.model_dir.glob(f"*{self.model_spec}*.onnx"))
             if not matches:
-                matches = sorted(self.model_dir.glob("*.onnx"))
+                matches = sorted(
+                    item
+                    for item in self.model_dir.glob("*.onnx")
+                    if "embed" not in item.name and "mel" not in item.name and "silero" not in item.name
+                )
             if not matches:
                 raise FileNotFoundError(
                     f"No ONNX wake model for {self.model_spec!r} in {self.model_dir}. "
@@ -121,7 +227,7 @@ class OpenWakeWordEngine:
             chosen = [item for item in matches if "embed" not in item.name and "mel" not in item.name]
             models = [str((chosen or matches)[0])]
             self.model_name = Path(models[0]).name
-        self._model = Model(wakeword_models=models, inference_framework="onnx")
+        self._model = Model(**onnx_runtime_kwargs(models, self.model_dir))
         return self._model
 
 

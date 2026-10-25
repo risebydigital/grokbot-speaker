@@ -14,10 +14,14 @@ class EnergyVad:
 
 
 class SileroVad:
-    """openWakeWord ships an ONNX Silero VAD. Fall back to energy if it is not installed."""
+    """Silero via openWakeWord's ONNX file. Fall back to energy if it is not installed.
 
-    def __init__(self, fallback: EnergyVad):
+    The VAD class has no TFLite path. `model_path` points at silero_vad.onnx.
+    """
+
+    def __init__(self, fallback: EnergyVad, model_path: str | None = None):
         self.fallback = fallback
+        self.model_path = model_path
         self._vad = None
         self._failed = False
 
@@ -28,7 +32,10 @@ class SileroVad:
             if self._vad is None:
                 from openwakeword.vad import VAD
 
-                self._vad = VAD()
+                kwargs = {}
+                if self.model_path:
+                    kwargs["model_path"] = self.model_path
+                self._vad = VAD(**kwargs)
             import numpy as np
 
             audio = np.frombuffer(frame, dtype=np.int16)

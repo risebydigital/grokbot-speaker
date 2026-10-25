@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Literal
 
@@ -269,22 +270,56 @@ def env_value(name: str) -> str | None:
     return value
 
 
+def _read_config_text(path: Path) -> tuple[str | None, str | None]:
+    """Return (text, error note). A missing file is (None, None), not an error."""
+    try:
+        if not path.is_file():
+            return None, None
+        return path.read_text(encoding="utf-8"), None
+    except OSError as exc:
+        return None, (
+            f"Cannot read {path} ({exc.__class__.__name__}). "
+            "Using the bundled example configuration. "
+            "/etc/gva should be mode 0755 and config.yaml mode 0644. "
+            "Secrets stay in /etc/gva/gva.env mode 0600."
+        )
+
+
 def load_config(path: Path | None = None) -> Config:
+    notes: list[str] = []
     if path is None:
         override = os.environ.get("GVA_CONFIG")
         etc = Path("/etc/gva/config.yaml")
         if override:
             path = Path(override)
-        elif etc.is_file():
-            path = etc
         else:
-            path = project_root() / "config" / "config.example.yaml"
+            text, note = _read_config_text(etc)
+            if note:
+                notes.append(note)
+                path = project_root() / "config" / "config.example.yaml"
+            elif text is not None:
+                path = etc
+            else:
+                path = project_root() / "config" / "config.example.yaml"
     path = Path(path)
     data: dict[str, Any] = {}
-    if path.is_file():
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    text, note = _read_config_text(path)
+    if note:
+        notes.append(note)
+        fallback = project_root() / "config" / "config.example.yaml"
+        if fallback != path:
+            text, fallback_note = _read_config_text(fallback)
+            if fallback_note:
+                notes.append(fallback_note)
+                text = None
+            else:
+                path = fallback
+    if text:
+        loaded = yaml.safe_load(text)
         if isinstance(loaded, dict):
             data = loaded
+    for note in notes:
+        print(note, file=sys.stderr)
     if env_value("GVA_ENV"):
         data.setdefault("device", {})["env"] = os.environ["GVA_ENV"].strip()
     if os.environ.get("GVA_LOG_DIR"):

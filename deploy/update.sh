@@ -11,9 +11,15 @@ fi
 APP=/opt/gva/app
 cd "$APP"
 git pull --ff-only
-if ! /opt/gva/venv/bin/pip install -e "$APP[voice]"; then
-  /opt/gva/venv/bin/pip install -e "$APP"
+# shellcheck disable=SC1091
+source "$APP/deploy/voice-packages.sh"
+# shellcheck disable=SC1091
+source "$APP/deploy/permissions.sh"
+install_voice_python /opt/gva/venv/bin/pip "$APP"
+if id gva >/dev/null 2>&1 && getent group audio >/dev/null; then
+  usermod -aG audio gva
 fi
+ensure_runtime_permissions
 systemctl restart gva-voice.service gva-backend.service gva-sync.service
 systemctl --no-pager --lines=20 status gva-voice.service || true
 echo "Updated. If the voice unit is failing, run: sudo gva doctor"

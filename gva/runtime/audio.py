@@ -58,6 +58,101 @@ def resample_pcm(pcm: bytes, from_rate: int, to_rate: int) -> bytes:
     return np.clip(np.round(converted), -32768, 32767).astype(np.int16).tobytes()
 
 
+def choose_stream_format(
+    source_rate: int,
+    default_rate: float | int,
+    max_channels: int,
+    supported,
+) -> tuple[int, int]:
+    """Pick a rate and channel count the device will open.
+
+    Try the source rate first, then the device default (often 48000 on the
+    Sanyun SW208). At each rate try mono, then stereo. That speaker only
+    accepts S16_LE, 2 channels, 48000 Hz.
+    """
+    rates: list[int] = []
+    for rate in (int(source_rate), int(round(float(default_rate or 0)))):
+        if rate > 0 and rate not in rates:
+            rates.append(rate)
+    if not rates:
+        rates = [int(source_rate) or 16000]
+    channels = [count for count in (1, 2) if count <= max(1, int(max_channels or 1))]
+    if not channels:
+        channels = [1]
+    for rate in rates:
+        for count in channels:
+            if supported(rate, count):
+                return rate, count
+    fallback = 2 if int(max_channels or 0) >= 2 else 1
+    return rates[-1], fallback
+
+
+def fit_playback(pcm: bytes, from_rate: int, to_rate: int, channels: int) -> bytes:
+    """Resample mono PCM and, when the device needs it, duplicate it to stereo."""
+    mono = resample_pcm(pcm, from_rate, to_rate)
+    count = max(1, int(channels))
+    if count == 1 or len(mono) < 2:
+        return mono
+    samples = np.frombuffer(mono, dtype=np.int16)
+    interleaved = np.repeat(samples, count)
+    return interleaved.astype(np.int16, copy=False).tobytes()
+
+
+def fit_capture(indata: np.ndarray, from_rate: int, to_rate: int) -> bytes:
+    """Downmix device audio to mono and resample to the rate the pipeline expects."""
+    audio = np.asarray(indata)
+    if audio.ndim == 2 and audio.shape[1] > 1:
+        mono = audio.astype(np.float64).mean(axis=1)
+    elif audio.ndim == 2:
+        mono = audio[:, 0]
+    else:
+        mono = audio.reshape(-1)
+    pcm = np.clip(np.round(mono), -32768, 32767).astype(np.int16).tobytes()
+    return resample_pcm(pcm, from_rate, to_rate)
+
+
+def _query_device(sd, device: int | None, kind: str) -> dict[str, Any]:
+    if device is None:
+        info = sd.query_devices(kind=kind)
+    else:
+        info = sd.query_devices(device)
+    if not isinstance(info, dict):
+        raise RuntimeError(f"no {kind} device")
+    return info
+
+
+def _supported(check, device: int | None, rate: int, channels: int) -> bool:
+    try:
+        check(device=device, channels=channels, dtype="int16", samplerate=rate)
+        return True
+    except Exception:
+        return False
+
+
+def probe_output(device: int | None, source_rate: int) -> tuple[int, int]:
+    import sounddevice as sd
+
+    info = _query_device(sd, device, "output")
+    return choose_stream_format(
+        source_rate,
+        info.get("default_samplerate") or source_rate,
+        int(info.get("max_output_channels") or 1),
+        lambda rate, channels: _supported(sd.check_output_settings, device, rate, channels),
+    )
+
+
+def probe_input(device: int | None, source_rate: int) -> tuple[int, int]:
+    import sounddevice as sd
+
+    info = _query_device(sd, device, "input")
+    return choose_stream_format(
+        source_rate,
+        info.get("default_samplerate") or source_rate,
+        int(info.get("max_input_channels") or 1),
+        lambda rate, channels: _supported(sd.check_input_settings, device, rate, channels),
+    )
+
+
 class JitterBuffer:
     """Holds PCM until a short pre-buffer is full, then plays it as one stream.
 
@@ -65,22 +160,29 @@ class JitterBuffer:
     and sounds chopped. This buffer is what the output callback reads instead.
     """
 
-    def __init__(self, prebuffer_frames: int = 0):
+    def __init__(self, prebuffer_frames: int = 0, channels: int = 1):
         self.prebuffer_frames = max(0, int(prebuffer_frames))
-        self._samples = np.zeros(0, dtype=np.int16)
+        self.channels = max(1, int(channels))
+        self._samples = np.zeros((0, self.channels), dtype=np.int16)
         self._primed = self.prebuffer_frames == 0
         self.underruns = 0
         self._lock = threading.Lock()
 
     def push(self, pcm: bytes) -> None:
+        """Push interleaved device-format PCM. `channels` matches the open stream."""
         if len(pcm) < 2:
             return
-        chunk = np.frombuffer(pcm, dtype=np.int16).copy()
+        flat = np.frombuffer(pcm, dtype=np.int16).copy()
+        usable = (flat.size // self.channels) * self.channels
+        if usable < self.channels:
+            return
+        frames = flat[:usable].reshape(-1, self.channels)
         with self._lock:
-            self._samples = np.concatenate([self._samples, chunk])
+            self._samples = np.concatenate([self._samples, frames], axis=0)
 
     def pull(self, frames: int) -> np.ndarray:
-        out = np.zeros(frames, dtype=np.int16)
+        """Return shape (frames, channels) at the device rate."""
+        out = np.zeros((frames, self.channels), dtype=np.int16)
         with self._lock:
             if not self._primed:
                 if len(self._samples) < self.prebuffer_frames:
@@ -96,7 +198,7 @@ class JitterBuffer:
 
     def clear(self) -> None:
         with self._lock:
-            self._samples = np.zeros(0, dtype=np.int16)
+            self._samples = np.zeros((0, self.channels), dtype=np.int16)
             self._primed = self.prebuffer_frames == 0
 
     def buffered(self) -> int:
@@ -135,7 +237,8 @@ def _can_play(dev: dict[str, Any]) -> bool:
     name = str(dev.get("name", "")).lower()
     if dev.get("error") or int(dev.get("outputs") or 0) <= 0:
         return False
-    if "airhug" in name or "bluetooth" in name or "bluez" in name:
+    # PipeWire and Pulse need a user session. The service opens ALSA hw devices.
+    if any(token in name for token in ("airhug", "bluetooth", "bluez", "pipewire", "pulse")):
         return False
     return True
 
@@ -187,6 +290,8 @@ class SoundDeviceCapture:
         self.sample_rate = sample_rate
         self.chunk_ms = chunk_ms
         self.on_lost = on_lost
+        self.device_rate = sample_rate
+        self.device_channels = 1
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=32)
         self._stream = None
         self._lost = threading.Event()
@@ -194,11 +299,12 @@ class SoundDeviceCapture:
     def start(self) -> None:
         import sounddevice as sd
 
-        block = chunk_samples(self.sample_rate, self.chunk_ms)
+        self.device_rate, self.device_channels = probe_input(self.device, self.sample_rate)
+        block = chunk_samples(self.device_rate, self.chunk_ms)
         self._stream = sd.InputStream(
             device=self.device,
-            channels=1,
-            samplerate=self.sample_rate,
+            channels=self.device_channels,
+            samplerate=self.device_rate,
             dtype="int16",
             blocksize=block,
             callback=self._on_audio,
@@ -208,7 +314,7 @@ class SoundDeviceCapture:
     def _on_audio(self, indata, frames, time_info, status) -> None:
         if status:
             self._lost.set()
-        pcm = np.ascontiguousarray(indata[:, 0]).tobytes()
+        pcm = fit_capture(indata, self.device_rate, self.sample_rate)
         try:
             self._queue.put_nowait(pcm)
         except queue.Full:
@@ -264,15 +370,28 @@ class SoundDeviceSink:
     def __init__(self, device: int | None, sample_rate: int, prebuffer_ms: int = 100):
         self.device = device
         self.sample_rate = sample_rate
-        self.buffer = JitterBuffer(int(sample_rate * prebuffer_ms / 1000))
+        self.device_rate = sample_rate
+        self.channels = 1
+        self.prebuffer_ms = prebuffer_ms
+        self.buffer = JitterBuffer(int(sample_rate * prebuffer_ms / 1000), channels=1)
         self._stopped = False
         self._stream = None
+        self._format_ready = False
+
+    def prepare(self) -> None:
+        """Choose the device rate and channel count before the first sample."""
+        if self._format_ready:
+            return
+        self.device_rate, self.channels = probe_output(self.device, self.sample_rate)
+        self.buffer = JitterBuffer(int(self.device_rate * self.prebuffer_ms / 1000), self.channels)
+        self._format_ready = True
 
     def write(self, pcm: bytes) -> None:
         if self._stopped or not pcm:
             return
+        self.prepare()
         self._ensure()
-        self.buffer.push(pcm)
+        self.buffer.push(fit_playback(pcm, self.sample_rate, self.device_rate, self.channels))
 
     def stop(self) -> None:
         """Drop queued speech immediately. The stream stays open for the next utterance."""
@@ -294,15 +413,16 @@ class SoundDeviceSink:
             return
         import sounddevice as sd
 
-        block = max(1, int(self.sample_rate * 0.02))
+        self.prepare()
+        block = max(1, int(self.device_rate * 0.02))
 
         def callback(outdata, frames, time_info, status) -> None:
-            outdata[:, 0] = self.buffer.pull(frames)
+            outdata[:] = self.buffer.pull(frames)
 
         self._stream = sd.OutputStream(
             device=self.device,
-            channels=1,
-            samplerate=self.sample_rate,
+            channels=self.channels,
+            samplerate=self.device_rate,
             dtype="int16",
             blocksize=block,
             callback=callback,

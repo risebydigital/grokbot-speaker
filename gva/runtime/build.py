@@ -43,7 +43,11 @@ def build_local(cfg: Config) -> VoiceAssistant:
     sink = SoundDeviceSink(_output_index(cfg), cfg.audio.sample_rate)
     wake = _wake(cfg)
     energy = EnergyVad(cfg.vad.energy_threshold)
-    vad = SileroVad(energy) if cfg.vad.engine == "silero" else energy
+    vad = (
+        SileroVad(energy, str(Path(cfg.wake.model_dir) / "silero_vad.onnx"))
+        if cfg.vad.engine == "silero"
+        else energy
+    )
     http = httpx.Client(timeout=httpx.Timeout(cfg.llm.timeouts.read_s, connect=cfg.llm.timeouts.connect_s))
     stt = SttRouter(cfg, FasterWhisperStt(cfg), XaiStt(cfg, http))
     tts = TtsRouter(cfg, PiperTts(cfg), XaiTts(cfg, http))

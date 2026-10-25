@@ -7,7 +7,11 @@ Wants=network-online.target
 Type=simple
 User=gva
 Group=gva
+# audio is supplementary so the process can open /dev/snd. There is no
+# PipeWire or PulseAudio session for this user. PortAudio talks to ALSA
+# hw devices directly. Do not point it at a user PipeWire socket.
 SupplementaryGroups=audio
+UMask=0022
 WorkingDirectory=/opt/gva/app
 Environment=GVA_CONFIG=/etc/gva/config.yaml
 Environment=PYTHONDONTWRITEBYTECODE=1

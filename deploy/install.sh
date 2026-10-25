@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install GVA on Raspberry Pi OS Lite (64-bit, Bookworm).
+# Install GVA on Raspberry Pi OS Lite (64-bit, Bookworm or Trixie).
 # Run from a checkout: sudo bash deploy/install.sh
 # This does not enable the firewall, and it does not start services until
 # `gva doctor` passes (which needs real secrets in /etc/gva/gva.env).
@@ -36,11 +36,13 @@ getent group gva-dev >/dev/null || groupadd gva-dev
 
 install -d -o gva -g gva -m 750 \
   /var/lib/gva \
-  /var/log/gva \
+  /var/log/gva
+install -d -o gva -g gva -m 755 \
+  /etc/gva \
+  /usr/share/gva \
   /usr/share/gva/wake \
   /usr/share/gva/voices \
-  /usr/share/gva/fallback \
-  /etc/gva
+  /usr/share/gva/fallback
 
 if [[ "$REPO" != "$APP" ]]; then
   install -d /opt/gva
@@ -55,19 +57,21 @@ chown -R gva:gva "$APP"
 if [[ ! -x "$VENV/bin/python" ]]; then
   python3 -m venv "$VENV"
 fi
-"$VENV/bin/pip" install --upgrade pip
-if ! "$VENV/bin/pip" install -e "$APP[voice]"; then
-  echo "Voice extras did not install. The core package is enough for doctor, sync, and tests."
-  "$VENV/bin/pip" install -e "$APP"
-fi
+# shellcheck disable=SC1091
+source "$REPO/deploy/voice-packages.sh"
+install_voice_python "$VENV/bin/pip" "$APP"
 ln -sfn "$VENV/bin/gva" /usr/local/bin/gva
 
 if [[ ! -f /etc/gva/config.yaml ]]; then
-  install -m 640 -o gva -g gva "$APP/config/config.example.yaml" /etc/gva/config.yaml
+  install -m 644 -o gva -g gva "$APP/config/config.example.yaml" /etc/gva/config.yaml
 fi
 if [[ ! -f /etc/gva/gva.env ]]; then
   install -m 600 -o gva -g gva "$APP/gva.env.example" /etc/gva/gva.env
 fi
+
+# shellcheck disable=SC1091
+source "$REPO/deploy/permissions.sh"
+ensure_runtime_permissions
 
 install -m 644 "$APP/deploy/logrotate/gva" /etc/logrotate.d/gva
 for unit in gva-voice.service gva-backend.service gva-sync.service gva-retention.service gva-retention.timer gva-backup.service gva-backup.timer; do

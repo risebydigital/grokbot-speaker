@@ -32,6 +32,15 @@ def test_configured_substring_wins():
     assert prefer_output(devices, "headphone") == 1
 
 
+def test_pipewire_is_not_the_speaker():
+    devices = [
+        _dev(0, "pipewire", outputs=2),
+        _dev(1, "pulse", outputs=2),
+        _dev(2, "USB2.0 Device: Audio (hw:4,0)", outputs=2),
+    ]
+    assert prefer_output(devices, "") == 2
+
+
 def test_airhug_and_bluetooth_are_not_speakers():
     devices = [
         _dev(0, "AIRHUG", inputs=2, outputs=2),
