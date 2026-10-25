@@ -241,6 +241,24 @@ class RetentionConfig(BaseModel):
     heartbeat_days: int = 90
 
 
+class BotBridgeConfig(BaseModel):
+    """Work questions go to the Grok Bot webhook. Quick chat stays on realtime.
+
+    `enabled` turns the bridge on by itself once the webhook URL, the webhook
+    key, and Supabase are all set. Set it false to force the bridge off.
+    """
+
+    enabled: bool = True
+    # Five minutes. A Grok Bot routine can start a few minutes after Milo asks.
+    timeout_s: int = Field(default=300, ge=5, le=900)
+    poll_s: float = Field(default=3, ge=0.2, le=60)
+    # Say "Still checking with the team" once, this long after the question. 0 disables it.
+    nudge_s: int = Field(default=45, ge=0, le=300)
+    key_header: str = "Authorization"
+    # "Bearer " includes the trailing space. An empty string sends the key with no prefix.
+    key_prefix: str = "Bearer "
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -260,6 +278,7 @@ class Config(BaseModel):
     sync: SyncConfig = Field(default_factory=SyncConfig)
     backend: BackendConfig = Field(default_factory=BackendConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    bot_bridge: BotBridgeConfig = Field(default_factory=BotBridgeConfig)
     source_path: Path | None = Field(default=None, exclude=True)
     source_data: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
@@ -533,6 +552,8 @@ def masked_secrets() -> dict[str, str]:
         "GVA_API_TOKEN_SECRET",
         "GVA_ALERT_SLACK_WEBHOOK",
         "GVA_HEARTBEAT_URL",
+        "GVA_GROKBOT_WEBHOOK_URL",
+        "GVA_GROKBOT_WEBHOOK_KEY",
     ]
     out = {}
     for name in names:

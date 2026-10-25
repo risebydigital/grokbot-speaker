@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,8 +56,13 @@ class EventLog:
         if self.validate:
             schema = json.loads(schema_path().read_text(encoding="utf-8"))
             self._validator = Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
+        self._emit_lock = threading.Lock()
 
     def emit(self, type_: str, level: str = "info", **fields: Any) -> dict[str, Any]:
+        with self._emit_lock:
+            return self._emit(type_, level, **fields)
+
+    def _emit(self, type_: str, level: str = "info", **fields: Any) -> dict[str, Any]:
         event: dict[str, Any] = {
             "schema_version": self.schema_version,
             "event_id": fields.pop("event_id", None) or new_ulid(),

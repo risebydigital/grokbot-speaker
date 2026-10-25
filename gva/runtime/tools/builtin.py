@@ -172,6 +172,35 @@ def set_device_level(args: dict[str, Any], ctx) -> dict[str, Any]:
     return {"ok": True, "device": device_id, "name": known[device_id].name, "level": level}
 
 
+def check_team_answer(args: dict[str, Any], ctx) -> dict[str, Any]:
+    """Return a team answer that arrived after Milo had already given up waiting."""
+    bridge = getattr(ctx, "bridge", None)
+    if bridge is None:
+        return {"status": "waiting"}
+    try:
+        answers = bridge.recall(deliver=False)
+    except Exception:
+        return {"status": "waiting"}
+    if not answers:
+        return {"status": "waiting"}
+    return {"status": "ready", "answer": " ".join(answers)}
+
+
+def ask_rbd_team(args: dict[str, Any], ctx) -> dict[str, Any]:
+    """Hand a Rise By Digital work question to the bot bridge. No polling here."""
+    question = str(args.get("question") or "").strip()
+    if not question:
+        return {"status": "error", "error": "missing question"}
+    bridge = getattr(ctx, "bridge", None)
+    if bridge is None:
+        return {"status": "error", "error": "could not reach the team"}
+    try:
+        bridge.submit(question)
+    except Exception:
+        return {"status": "error", "error": "could not reach the team"}
+    return {"status": "sent"}
+
+
 def get_calendar_events(args: dict[str, Any], ctx) -> dict[str, Any]:
     """No calendar backend is configured. Say so. Do not invent events."""
     return {"ok": False, "error": "calendar not connected", "range": args.get("range") or "today"}
@@ -199,4 +228,6 @@ HANDLERS = {
     "set_device_level": set_device_level,
     "get_calendar_events": get_calendar_events,
     "get_time": get_time,
+    "ask_rbd_team": ask_rbd_team,
+    "check_team_answer": check_team_answer,
 }

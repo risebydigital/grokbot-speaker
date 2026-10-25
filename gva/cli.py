@@ -41,6 +41,7 @@ models_app = typer.Typer(help="Wake-word and voice downloads.")
 auth_app = typer.Typer(help="Local API tokens.")
 maintenance_app = typer.Typer(help="Retention and backups.")
 sync_app = typer.Typer(help="Supabase sync.")
+bridge_app = typer.Typer(help="Rise By Digital bot bridge.")
 app.add_typer(audio_app, name="audio")
 app.add_typer(config_app, name="config")
 app.add_typer(logs_app, name="logs")
@@ -49,6 +50,7 @@ app.add_typer(models_app, name="models")
 app.add_typer(auth_app, name="auth")
 app.add_typer(maintenance_app, name="maintenance")
 app.add_typer(sync_app, name="sync")
+app.add_typer(bridge_app, name="bridge")
 
 
 def _cfg():
@@ -162,6 +164,16 @@ def doctor() -> None:
     """Check configuration, secrets, and directories before enabling systemd."""
     cfg = _cfg()
     problems, warnings = doctor_checks(cfg)
+    from gva.runtime.bridge import bridge_status, supabase_doctor_line
+
+    auth_line, probed = supabase_doctor_line(cfg)
+    typer.echo(auth_line)
+    line, bridge_warning = bridge_status(cfg, probed=probed)
+    typer.echo(line)
+    if bridge_warning:
+        warnings = [*warnings, bridge_warning]
+    elif probed is not None and not probed[0]:
+        warnings = [*warnings, f"milo_bot_answers read returned {probed[1]}"]
     for warning in warnings:
         typer.echo(f"warning: {warning}")
     for problem in problems:
@@ -169,6 +181,26 @@ def doctor() -> None:
     if problems:
         raise typer.Exit(1)
     typer.echo("doctor: ok")
+
+
+@bridge_app.command("test")
+def bridge_test(
+    question: str | None = typer.Argument(None, help="Optional. Default is a fixed harmless test question."),
+) -> None:
+    """Send a harmless test question. Print the webhook status and whether an answer arrived."""
+    cfg = _cfg()
+    from gva.runtime.bridge import BotBridge, bridge_configured
+
+    if not bridge_configured(cfg):
+        typer.echo("bridge: not configured", err=True)
+        raise typer.Exit(1)
+    store = _store(cfg)
+    events = _events(cfg, store)
+    report = BotBridge(cfg, events).run_test(question)
+    for line in report.lines():
+        typer.echo(line)
+    if not report.ok():
+        raise typer.Exit(1)
 
 
 @app.command()

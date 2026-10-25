@@ -14,6 +14,7 @@ import yaml
 
 from gva.config import Config
 from gva.paths import tools_dir
+from gva.runtime.bridge import bridge_configured
 from gva.runtime.tools.builtin import HANDLERS
 from gva.telemetry.redact import redact_value
 from gva.telemetry.store import Store
@@ -38,6 +39,7 @@ class ToolContext:
     store: Store
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     http: Any | None = None
+    bridge: Any | None = None
 
 
 @dataclass
@@ -158,6 +160,13 @@ def load_registry(cfg: Config, store: Store, http: Any | None = None, now: Calla
         for path in sorted(directory.glob("*.yaml")):
             data = yaml.safe_load(path.read_text(encoding="utf-8"))
             name = data["name"]
+            if name in {"ask_rbd_team", "check_team_answer"} and not bridge_configured(cfg):
+                continue
+            if name == "get_calendar_events" and bridge_configured(cfg):
+                data["description"] = (
+                    "No separate calendar is connected here. Rise By Digital work, "
+                    "Asana, reports, client work, and email go to ask_rbd_team instead."
+                )
             _apply_device_enum(cfg, name, data)
             handler = HANDLERS.get(name)
             if handler is None:
