@@ -1,0 +1,13 @@
+name: check_team_answer
+description: >
+  Call this when the user asks if the team has replied yet, including
+  "any answer yet?". If the result status is ready, read the answer out
+  briefly and do not add to it. If the status is waiting, say that nothing
+  is back from the team yet.
+timeout_s: 15
+risk: low
+personal_data: true
+parameters:
+  type: object
+  additionalProperties: false
+  properties: {}

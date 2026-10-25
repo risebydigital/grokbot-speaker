@@ -117,10 +117,11 @@ Non-secret settings live in `/etc/gva/config.yaml`, seeded from [`config/config.
 | `wake.patience_frames` | `2` | Hits in a row before the session opens |
 | `wake.cooldown_seconds` | `3` | Quiet time after a session |
 | `bot_bridge.enabled` | `true` | Off when false. Otherwise on once the webhook and Supabase are set |
-| `bot_bridge.timeout_s` | `180` | How long Milo waits for the team |
+| `bot_bridge.timeout_s` | `300` | How long Milo waits before saying the team has not replied yet |
 | `bot_bridge.poll_s` | `3` | How often Milo checks for an answer |
+| `bot_bridge.nudge_s` | `45` | One "still checking" line. `0` turns it off |
 | `bot_bridge.key_header` | `Authorization` | Header name copied from the Grok Bot routine panel |
-| `bot_bridge.key_prefix` | `Bearer ` | Prefix copied from that panel, including the trailing space |
+| `bot_bridge.key_prefix` | `Bearer ` | Prefix copied from that panel. `""` sends no prefix |
 
 Change an allow-listed key with `gva config set <key> <value>`. Secrets are rejected there. They belong only in the env file.
 
@@ -137,9 +138,17 @@ The bridge turns on by itself when all four of these are set:
 
 `bot_bridge.enabled: false` forces it off even when those values are present. While it is off, the `ask_rbd_team` tool is not offered to the model.
 
-On a work question Milo makes a `request_id` and posts `{request_id, device_id, question, asked_at, reply_by}` to the webhook. The header name and prefix come from `bot_bridge.key_header` and `bot_bridge.key_prefix`. Copy both from the Grok Bot routine panel, and quote the prefix so a trailing space is kept (`key_prefix: "Bearer "`). The post times out after 10 seconds and is tried once more. The key is never written to the log. A query string on the webhook URL is never written either.
+On a work question Milo makes a `request_id` and posts `{request_id, device_id, question, asked_at, reply_by}` to the webhook. The header name and prefix come from `bot_bridge.key_header` and `bot_bridge.key_prefix`. Copy both from the Grok Bot routine panel. Quote the prefix so a trailing space is kept:
 
-Milo says it is checking with the team, then polls `public.milo_bot_answers` until the answer arrives or `bot_bridge.timeout_s` runs out. Polling continues after the voice session has closed and Milo is back on the wake word. When a row arrives, Milo reads it out. If the session is still open, it is spoken there. If the session has closed, Milo plays a short chime, then reads the text on a short realtime session (verbatim), or with Piper if that session cannot start. The row's `read_at` is filled in afterwards. If nothing arrives in time, Milo says: "Sorry, the team didn't get back to me in time. Try again in a bit."
+```yaml
+bot_bridge:
+  key_header: Authorization
+  key_prefix: "Bearer "
+```
+
+If the panel sends the key with no prefix, set `key_prefix: ""`. The header value is then the key on its own. The header name can be changed the same way, for example `key_header: X-Api-Key`. The post times out after 10 seconds and is tried once more. The key is never written to the log. A query string on the webhook URL is never written either.
+
+Milo says it is checking with the team, then polls `public.milo_bot_answers` until the answer arrives or `bot_bridge.timeout_s` runs out (five minutes by default, because a routine can start a few minutes late). About 45 seconds in, Milo says once: "Still checking with the team." Polling continues after the voice session has closed and Milo is back on the wake word. When a row arrives in time, Milo reads it out. If the session is still open, it is spoken there. If the session has closed, Milo plays a short chime, then reads the text on a short realtime session (verbatim), or with Piper if that session cannot start. The row's `read_at` is filled in afterwards. If nothing arrives in time, Milo says: "Sorry, the team didn't get back to me in time. I'll have it next time you ask." The request is kept. A later row is still read out on the next wake, or when you ask "any answer yet?".
 
 `bridge.sent`, `bridge.answered` (with `latency_ms`), `bridge.timeout`, and `bridge.error` go to the local event log and the on-device database. They are not uploaded with the voice-ops sync, and they do not contain the question or the answer.
 
@@ -154,11 +163,11 @@ This repository does not create the table. Add it in the Supabase project (Lovab
 | `request_id` | text, primary key |
 | `device_id` | text |
 | `answer` | text, not null |
-| `answered_by` | text |
+| `answered_by` | text. Any bot name. Brenda is the bot that answers these |
 | `created_at` | timestamptz, default `now()` |
 | `read_at` | timestamptz |
 
-Row level security on, and only the service role may read or write. An edge function named `milo-answer` is what writes the rows when a bot replies.
+Row level security on, and only the service role may read or write. An edge function named `milo-answer` is what writes the rows. Brenda is the bot that answers now. `answered_by` is her name, or the name of whichever bot replies. Any name is accepted.
 
 On the Pi, after this branch is on `main`:
 

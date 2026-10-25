@@ -11,6 +11,7 @@ from gva.config import Config, load_config, masked_secrets
 from gva.paths import project_root
 from gva.runtime.audio import FALLBACK_PHRASE, CollectingSink
 from gva.runtime.bridge import (
+    STILL_CHECKING_LINE,
     TIMEOUT_LINE,
     WAITING_LINE,
     BridgeError,
@@ -147,15 +148,18 @@ def test_tool_is_hidden_until_the_bridge_is_configured(monkeypatch, tmp_path):
     assert bridge_configured(cfg) is False
     tools = load_registry(cfg, store)
     assert "ask_rbd_team" not in tools.specs
+    assert "check_team_answer" not in tools.specs
     protocol = RealtimeProtocol(cfg, events, store, tools, CollectingSink())
     names = [item["name"] for item in protocol.session_update()["session"]["tools"]]
     assert "ask_rbd_team" not in names
+    assert "check_team_answer" not in names
     assert "not connected" in render_system(cfg).lower()
 
     _enable(monkeypatch)
     cfg.bot_bridge.enabled = False
     assert bridge_configured(cfg) is False
     assert "ask_rbd_team" not in load_registry(cfg, store).specs
+    assert "check_team_answer" not in load_registry(cfg, store).specs
 
 
 def test_tool_is_advertised_when_configured(monkeypatch, tmp_path):
@@ -169,6 +173,7 @@ def test_tool_is_advertised_when_configured(monkeypatch, tmp_path):
     protocol = RealtimeProtocol(cfg, events, store, tools, CollectingSink())
     described = {item["name"]: item["description"] for item in protocol.session_update()["session"]["tools"]}
     assert "ask_rbd_team" in described
+    assert "any answer yet" in described["check_team_answer"].lower()
     prompt = render_system(cfg)
     assert "ask_rbd_team" in prompt
     assert "call get_calendar_events" not in prompt
@@ -283,6 +288,74 @@ def test_timeout_says_the_team_did_not_reply(monkeypatch, tmp_path):
     assert store.recent("bridge.answered", 1) == []
     assert http.patches == []
     _assert_clean(_logged(tmp_path, store))
+
+
+def test_nudge_is_spoken_once_around_45_seconds(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    spoken = []
+    cfg, store, _events, bridge = _bridge(tmp_path, http, speaker=spoken.append)
+    cfg.bot_bridge.timeout_s = 60
+    cfg.bot_bridge.poll_s = 15
+    cfg.bot_bridge.nudge_s = 45
+    bridge.submit(QUESTION, background=False)
+    assert spoken == [STILL_CHECKING_LINE, TIMEOUT_LINE]
+    assert spoken.count(STILL_CHECKING_LINE) == 1
+    _assert_clean(_logged(tmp_path, store))
+
+
+def test_empty_prefix_sends_the_key_alone(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    cfg, store, _events, bridge = _bridge(tmp_path, http, speaker=lambda _text: None)
+    cfg.bot_bridge.key_header = "X-Api-Key"
+    cfg.bot_bridge.key_prefix = ""
+    bridge.submit(QUESTION, background=False)
+    sent = http.posts[0]["headers"]["X-Api-Key"]
+    assert sent == WEBHOOK_KEY
+    assert not sent.startswith("Bearer")
+    _assert_clean(_logged(tmp_path, store))
+
+
+def test_late_answer_is_kept_for_the_next_wake_or_a_later_ask(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    spoken = []
+    cfg, store, events, bridge = _bridge(tmp_path, http, speaker=spoken.append)
+    bridge.submit(QUESTION, background=False)
+    assert spoken == [TIMEOUT_LINE]
+    assert http.patches == []
+    pending = json.loads(bridge._pending_path().read_text(encoding="utf-8"))
+    assert pending["request_ids"]
+    assert QUESTION not in json.dumps(pending)
+    assert ANSWER not in json.dumps(pending)
+
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda", "read_at": None}]
+    protocol = RealtimeProtocol(cfg, events, store, load_registry(cfg, store), CollectingSink())
+    bridge.attach(protocol)
+    found = bridge.recall(deliver=True)
+    assert found == [ANSWER]
+    assert spoken == [TIMEOUT_LINE]
+    queued = protocol._bridge_items[0]["messages"][0]["item"]["content"][0]["text"]
+    assert queued == ANSWER
+    assert http.patches
+    assert "Brenda" not in _logged(tmp_path, store)
+    assert bridge.recall(deliver=True) == []
+
+    tools = load_registry(cfg, store)
+    tools.ctx.bridge = bridge
+    waiting = tools.run("later", "check_team_answer", "{}")
+    assert waiting.result["status"] == "waiting"
+
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    bridge._remember("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    ready = tools.run("ask", "check_team_answer", "{}")
+    assert ready.result["status"] == "ready"
+    assert ready.result["answer"] == ANSWER
+    assert ready.args_redacted == {}
+    assert ANSWER not in _logged(tmp_path, store)
+    _assert_clean(_logged(tmp_path, store).replace(ANSWER, ""))
 
 
 def test_answer_after_the_session_closed_chimes_and_speaks(monkeypatch, tmp_path):
@@ -416,8 +489,9 @@ def test_example_files_document_the_bridge(monkeypatch):
     monkeypatch.setenv("GVA_ENV_FILE", "/no/such/gva.env")
     cfg = load_config(project_root() / "config" / "config.example.yaml")
     assert cfg.bot_bridge.enabled is True
-    assert cfg.bot_bridge.timeout_s == 180
+    assert cfg.bot_bridge.timeout_s == 300
     assert cfg.bot_bridge.poll_s == 3
+    assert cfg.bot_bridge.nudge_s == 45
     assert cfg.bot_bridge.key_header == "Authorization"
     assert cfg.bot_bridge.key_prefix == "Bearer "
     example = (project_root() / "gva.env.example").read_text(encoding="utf-8")
@@ -426,6 +500,8 @@ def test_example_files_document_the_bridge(monkeypatch):
     readme = (project_root() / "README.md").read_text(encoding="utf-8")
     assert "milo_bot_answers" in readme
     assert "milo-answer" in readme
+    assert "Brenda" in readme
+    assert 'key_prefix: ""' in readme
     assert "no migration" in readme.lower()
     assert "—" not in readme
     assert "–" not in readme

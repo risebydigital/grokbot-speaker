@@ -212,8 +212,13 @@ retention:
 # GVA_GROKBOT_WEBHOOK_URL, GVA_GROKBOT_WEBHOOK_KEY, and Supabase are all set.
 bot_bridge:
   enabled: true
-  timeout_s: 180
+  # A routine can start a few minutes late, so Milo waits five minutes.
+  timeout_s: 300
   poll_s: 3
-  # Copy these from the Grok Bot routine panel. Quote the prefix so the trailing space stays.
+  # One spoken check-in while the wait is still going. 0 turns that off.
+  nudge_s: 45
+  # Copy the header name and prefix from the Grok Bot routine panel.
+  # Quote the prefix so a trailing space stays: "Bearer "
+  # Use key_prefix: "" when the panel sends the key with no prefix at all.
   key_header: Authorization
   key_prefix: "Bearer "

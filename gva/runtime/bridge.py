@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from gva.config import ENV_FILE_STATUS, Config, env_value, load_service_env
@@ -21,7 +22,9 @@ from gva.ids import new_ulid, utc_now_ms
 from gva.telemetry.events import EventLog
 
 WAITING_LINE = "Give me a moment, I'm checking with the team."
-TIMEOUT_LINE = "Sorry, the team didn't get back to me in time. Try again in a bit."
+STILL_CHECKING_LINE = "Still checking with the team."
+TIMEOUT_LINE = "Sorry, the team didn't get back to me in time. I'll have it next time you ask."
+NOT_YET_LINE = "Nothing back from the team yet."
 UNREACHABLE_LINE = "Sorry, I couldn't reach the team just now."
 
 CALENDAR_BULLET = (
@@ -31,7 +34,9 @@ CALENDAR_BULLET = (
 WORK_BULLET = (
     "- Rise By Digital work questions (Asana tasks, reports due, client work, "
     "Adam's calendar, and emails) use ask_rbd_team. Tell the caller you are checking "
-    "with the team. Do not invent tasks, meetings, or emails. Answer everything else yourself."
+    "with the team. Do not invent tasks, meetings, or emails. "
+    "If they ask whether an answer has come back yet, call check_team_answer and read it if one is waiting. "
+    "Answer everything else yourself."
 )
 
 WEBHOOK_TIMEOUT_S = 10.0
@@ -160,7 +165,11 @@ class BotBridge:
         self._connector = connector
         self._protocol = None
         self._lock = threading.Lock()
+        self._kept_lock = threading.Lock()
+        self._kept: dict[str, int] = {}
+        self._inflight: set[str] = set()
         self.deliver = True
+        self._load_kept()
 
     def attach(self, protocol) -> None:
         with self._lock:
@@ -256,7 +265,7 @@ class BotBridge:
         if prefix is None:
             prefix = "Bearer "
         headers = {
-            header_name: f"{prefix}{key}",
+            header_name: f"{prefix}{key}" if prefix else key,
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
@@ -271,6 +280,7 @@ class BotBridge:
                 break
             code = int(getattr(response, "status_code", 0) or 0)
             if 200 <= code < 300:
+                self._remember(request_id)
                 self.events.emit("bridge.sent", request_id=request_id)
                 return request_id, started
             last_error = f"HTTP {code}" if code else "bridge error"
@@ -282,20 +292,36 @@ class BotBridge:
         self._emit_error(last_error, request_id)
         raise BridgeError("could not reach the team")
 
-    def _watch(self, request_id: str, started: float) -> str | None:
+    def recall(self, *, deliver: bool) -> list[str]:
+        """Read answers that arrived after the spoken wait. Leaves in-flight questions alone."""
         try:
-            row = self._poll(request_id, started)
+            return self._recall(deliver=deliver)
         except Exception as exc:
-            self._emit_error(exc.__class__.__name__, request_id)
-            return None
-        if not row:
+            self._emit_error(exc.__class__.__name__)
+            return []
+
+    def _watch(self, request_id: str, started: float) -> str | None:
+        self._enter_inflight(request_id)
+        try:
             try:
-                self.events.emit("bridge.timeout", level="warning", request_id=request_id)
-            except Exception:
-                pass
-            if self.deliver:
-                self.deliver_text(TIMEOUT_LINE, naturally=False, chime=False)
-            return None
+                row = self._poll(request_id, started)
+            except Exception as exc:
+                self._emit_error(exc.__class__.__name__, request_id)
+                return None
+            if not row:
+                try:
+                    self.events.emit("bridge.timeout", level="warning", request_id=request_id)
+                except Exception:
+                    pass
+                if self.deliver:
+                    self.deliver_text(TIMEOUT_LINE, naturally=False, chime=False)
+                return None
+            return self._accept(request_id, row, started)
+        finally:
+            self._leave_inflight(request_id)
+
+    def _accept(self, request_id: str, row: dict[str, Any], started: float) -> str | None:
+        self._forget(request_id)
         latency = max(0, int((self._mono() - started) * 1000))
         try:
             self.events.emit("bridge.answered", request_id=request_id, latency_ms=latency)
@@ -307,8 +333,33 @@ class BotBridge:
             self.deliver_text(answer, naturally=True, chime=True)
         return answer or None
 
+    def _recall(self, *, deliver: bool) -> list[str]:
+        found: list[str] = []
+        for request_id in self._kept_ids():
+            if self._is_inflight(request_id):
+                continue
+            row, error = self._fetch(request_id)
+            if error or not row:
+                continue
+            answer = str(row.get("answer") or "").strip()
+            if not answer:
+                continue
+            latency = self._late_latency_ms(request_id)
+            self._forget(request_id)
+            try:
+                self.events.emit("bridge.answered", request_id=request_id, latency_ms=latency)
+            except Exception:
+                pass
+            self._mark_read(request_id)
+            found.append(answer)
+            if deliver and self.deliver:
+                self.deliver_text(answer, naturally=True, chime=True)
+        return found
+
     def _poll(self, request_id: str, started: float) -> dict[str, Any] | None:
         deadline = started + float(self.cfg.bot_bridge.timeout_s)
+        nudge_s = int(self.cfg.bot_bridge.nudge_s)
+        nudged = False
         told = False
         while True:
             row = None
@@ -324,6 +375,11 @@ class BotBridge:
                 return row
             if self._mono() >= deadline:
                 return None
+            elapsed = self._mono() - started
+            if nudge_s > 0 and not nudged and elapsed >= nudge_s:
+                nudged = True
+                if self.deliver:
+                    self.deliver_text(STILL_CHECKING_LINE, naturally=False, chime=False)
             self._sleep(float(self.cfg.bot_bridge.poll_s))
 
     def _fetch(self, request_id: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -374,6 +430,69 @@ class BotBridge:
         code = int(getattr(response, "status_code", 0) or 0)
         if code >= 400:
             self._emit_error(f"HTTP {code}", request_id)
+
+    def _remember(self, request_id: str) -> None:
+        with self._kept_lock:
+            self._kept[request_id] = int(time.time() * 1000)
+            self._save_kept()
+
+    def _forget(self, request_id: str) -> None:
+        with self._kept_lock:
+            self._kept.pop(request_id, None)
+            self._save_kept()
+
+    def _kept_ids(self) -> list[str]:
+        with self._kept_lock:
+            return list(self._kept)
+
+    def _late_latency_ms(self, request_id: str) -> int:
+        with self._kept_lock:
+            asked = self._kept.get(request_id)
+        if not asked:
+            return 0
+        return max(0, int(time.time() * 1000) - int(asked))
+
+    def _enter_inflight(self, request_id: str) -> None:
+        with self._kept_lock:
+            self._inflight.add(request_id)
+
+    def _leave_inflight(self, request_id: str) -> None:
+        with self._kept_lock:
+            self._inflight.discard(request_id)
+
+    def _is_inflight(self, request_id: str) -> bool:
+        with self._kept_lock:
+            return request_id in self._inflight
+
+    def _pending_path(self) -> Path:
+        return Path(self.cfg.telemetry.db_path).with_name("bridge-pending.json")
+
+    def _load_kept(self) -> None:
+        try:
+            data = json.loads(self._pending_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        raw = data.get("request_ids") if isinstance(data, dict) else None
+        if not isinstance(raw, dict):
+            return
+        with self._kept_lock:
+            for key, value in raw.items():
+                if not isinstance(key, str) or not key:
+                    continue
+                try:
+                    self._kept[key] = int(value)
+                except (TypeError, ValueError):
+                    self._kept[key] = 0
+
+    def _save_kept(self) -> None:
+        path = self._pending_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"request_ids": self._kept}), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            return
 
     def _table_url(self) -> str | None:
         url = env_value("SUPABASE_URL")

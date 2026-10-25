@@ -28,7 +28,7 @@ from typing import Any
 from gva.config import Config, env_value
 from gva.ids import new_ulid, utc_now_ms
 from gva.runtime.audio import FALLBACK_PHRASE, play_fallback_phrase, resample_pcm
-from gva.runtime.bridge import UNREACHABLE_LINE, WAITING_LINE
+from gva.runtime.bridge import NOT_YET_LINE, UNREACHABLE_LINE, WAITING_LINE
 from gva.runtime.conversation import render_system
 from gva.runtime.textutil import is_stop_phrase
 from gva.telemetry.events import EventLog
@@ -296,9 +296,10 @@ class RealtimeProtocol:
         self.events.emit("tool.started", tool_name=name, tool_call_id=call_id)
         outcome = self.tools.run(call_id, name, arguments)
         self._tools.append(name)
-        if name == "ask_rbd_team":
-            # The question is personal. Keep it out of the event log.
+        if name in {"ask_rbd_team", "check_team_answer"}:
+            # Questions and answers are personal. Keep them out of the event log.
             outcome.args_redacted = {}
+        if name == "ask_rbd_team":
             if outcome.result.get("status") == "sent":
                 phrase = WAITING_LINE
             else:
@@ -306,6 +307,18 @@ class RealtimeProtocol:
             self._bridge_ack_pending = True
             self._bridge_ack_phrase = phrase
             self._response_instructions = f"Say only: {phrase}"
+        elif name == "check_team_answer":
+            if outcome.result.get("status") == "ready":
+                phrase = str(outcome.result.get("answer") or "").strip() or NOT_YET_LINE
+                self._response_instructions = (
+                    "Read the team's answer out naturally and briefly, in British English. "
+                    "Do not add anything that is not in the answer."
+                )
+            else:
+                phrase = NOT_YET_LINE
+                self._response_instructions = f"Say only: {phrase}"
+            self._bridge_ack_pending = True
+            self._bridge_ack_phrase = phrase
         level = "info" if outcome.status == "ok" else "warning"
         if outcome.rejected:
             self.events.emit(
@@ -717,6 +730,7 @@ class RealtimeAssistant:
         self.events.ctx.session_id = protocol.session_id
         if self.bridge is not None:
             self.bridge.attach(protocol)
+            self.bridge.recall(deliver=True)
         try:
             aec = None
             if self.cfg.audio.aec_enabled:

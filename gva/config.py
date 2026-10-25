@@ -249,9 +249,13 @@ class BotBridgeConfig(BaseModel):
     """
 
     enabled: bool = True
-    timeout_s: int = Field(default=180, ge=5, le=900)
+    # Five minutes. A Grok Bot routine can start a few minutes after Milo asks.
+    timeout_s: int = Field(default=300, ge=5, le=900)
     poll_s: float = Field(default=3, ge=0.2, le=60)
+    # Say "Still checking with the team" once, this long after the question. 0 disables it.
+    nudge_s: int = Field(default=45, ge=0, le=300)
     key_header: str = "Authorization"
+    # "Bearer " includes the trailing space. An empty string sends the key with no prefix.
     key_prefix: str = "Bearer "
 
 
