@@ -1,7 +1,7 @@
 /* Approved living-room reference styles. */
 
 :root{--navy:#052A48;--teal:#00A897;--ink:#031B2F;--panel:#123551;--line:#284862;--text:#E1E5E9;--muted:#A0AEB9;
---t1:#05344E;--t2:#043E55;--t3:#044B5D;--t4:#035C68;--t5:#027677;--t6:#018F87}
+--t1:#05344E;--t2:#043E55;--t3:#044B5D;--t4:#035C68;--t5:#027677;--t6:#00A897}
 *{box-sizing:border-box}
 html,body{margin:0}
 body{background:var(--navy);color:var(--text);font:400 16px/1.6 Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased}

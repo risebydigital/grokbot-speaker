@@ -31,6 +31,7 @@ html { scroll-behavior: smooth; }
   font-display: swap;
   src: url("../assets/fonts/roboto-mono-400.woff2") format("woff2");
 }
+@font-face{font-family:"Roboto Mono";font-style:normal;font-weight:500;font-display:swap;src:url("../assets/fonts/roboto-mono-500.woff2") format("woff2")}
 
 .skip {
   position: absolute;
@@ -84,7 +85,12 @@ button.chip {
   font-family: "Roboto Mono", ui-monospace, monospace;
   color: #fff;
 }
-.btn.primary:hover { background: #018F87; border-color: #018F87; }
+.btn.primary:hover {
+  background: #00A897;
+  border-color: #00A897;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
 
 :focus-visible {
   outline: 2px solid #052A48;
