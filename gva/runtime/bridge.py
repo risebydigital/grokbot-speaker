@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from gva.backend.supabase_headers import supabase_rest_headers
 from gva.config import ENV_FILE_STATUS, Config, env_value, load_service_env
 from gva.ids import new_ulid, utc_now_ms
 from gva.telemetry.events import EventLog
@@ -86,28 +87,66 @@ def bridge_configured(cfg: Config) -> bool:
     )
 
 
-def bridge_status(cfg: Config, probe: Callable[[Config], tuple[bool, str]] | None = None) -> tuple[str, str | None]:
+def bridge_status(
+    cfg: Config,
+    probe: Callable[[Config], tuple[bool, str]] | None = None,
+    probed: tuple[bool, str] | None = None,
+) -> tuple[str, str | None]:
     """Doctor line, plus a warning when the answers table cannot be read.
 
     The warning does not include the webhook, the key, or a response body.
+    ``probed`` reuses a read already done for the Supabase doctor line.
     """
     load_service_env()
     if not bridge_configured(cfg):
         if ENV_FILE_STATUS == "unreadable":
             return "bridge: not checked (cannot read the env file)", None
         return "bridge: not configured", None
+    if probed is None:
+        check = probe or probe_answers
+        try:
+            ok, detail = check(cfg)
+        except Exception as exc:
+            ok, detail = False, exc.__class__.__name__
+    else:
+        ok, detail = probed
+    if ok:
+        return "bridge: configured, milo_bot_answers reachable", None
+    key = env_value("SUPABASE_SERVICE_KEY") or ""
+    shown = str(detail).replace(key, "") if key else str(detail)
+    safe = _public_error(shown)
+    return (
+        "bridge: configured, milo_bot_answers not reachable",
+        f"milo_bot_answers is not reachable ({safe})",
+    )
+
+
+def supabase_doctor_line(
+    cfg: Config,
+    probe: Callable[[Config], tuple[bool, str]] | None = None,
+) -> tuple[str, tuple[bool, str] | None]:
+    """Harmless authenticated read of milo_bot_answers.
+
+    The line is ``supabase: OK`` or ``supabase: HTTP <status>``. It never
+    includes the key, the URL, or a row. The second value is the probe result
+    so the bridge line can reuse it, or None when nothing was read.
+    """
+    load_service_env()
+    url = env_value("SUPABASE_URL")
+    key = env_value("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        if ENV_FILE_STATUS == "unreadable":
+            return "supabase: not checked (cannot read the env file)", None
+        return "supabase: not configured", None
     check = probe or probe_answers
     try:
         ok, detail = check(cfg)
     except Exception as exc:
         ok, detail = False, exc.__class__.__name__
+    safe = _public_error(str(detail).replace(key, ""))
     if ok:
-        return "bridge: configured, milo_bot_answers reachable", None
-    safe = _public_error(str(detail))
-    return (
-        "bridge: configured, milo_bot_answers not reachable",
-        f"milo_bot_answers is not reachable ({safe})",
-    )
+        return "supabase: OK", (True, "ok")
+    return f"supabase: {safe}", (False, safe)
 
 
 def probe_answers(cfg: Config, http: Any | None = None) -> tuple[bool, str]:
@@ -117,11 +156,7 @@ def probe_answers(cfg: Config, http: Any | None = None) -> tuple[bool, str]:
     if not url or not key:
         return False, "not_configured"
     endpoint = url.rstrip("/") + "/rest/v1/milo_bot_answers"
-    headers = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Accept": "application/json",
-    }
+    headers = supabase_rest_headers(key, content_type=False)
     params = {"select": "request_id", "limit": "1"}
     owns = http is None
     client = http if http is not None else _http_client(5.0)
@@ -557,11 +592,7 @@ class BotBridge:
         key = env_value("SUPABASE_SERVICE_KEY")
         if not key or not env_value("SUPABASE_URL"):
             return None
-        return {
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
-            "Accept": "application/json",
-        }
+        return supabase_rest_headers(key, content_type=False)
 
     def _client(self):
         if self._http is not None:

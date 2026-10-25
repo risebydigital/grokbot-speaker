@@ -69,6 +69,8 @@ sudo systemctl enable --now gva-voice.service gva-backend.service gva-retention.
 
 Enable `gva-sync.service` only after `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` are set. The installer leaves it disabled until then. A blank URL makes `gva sync run` log that sync is idle and exit 0, so systemd does not restart it in a loop.
 
+`SUPABASE_SERVICE_KEY` may be a new Supabase secret (`sb_secret_...`) or a legacy service_role JWT. Sync and the bridge send a new key only in the `apikey` header. A legacy JWT is also sent as `Authorization: Bearer`. `gva doctor` checks that key with one read of `milo_bot_answers` (`select=request_id&limit=1`) and prints `supabase: OK` or the HTTP status. It never prints the key or a row.
+
 `gva doctor` must succeed before the voice service is enabled. A failed doctor run still installs the units, and leaves them stopped.
 
 ## Updating
@@ -138,6 +140,8 @@ The bridge turns on by itself when all four of these are set:
 
 `bot_bridge.enabled: false` forces it off even when those values are present. While it is off, the `ask_rbd_team` tool is not offered to the model.
 
+The Supabase key is not the webhook key. A new `sb_secret_` key is sent only as `apikey` when Milo reads `milo_bot_answers`. A legacy service_role JWT is sent as `apikey` and as `Authorization: Bearer`. Brenda's webhook still uses its own header, below.
+
 Brenda's routine expects the header `Authorization: Bearer <key>`. That is the default. The key is `GVA_GROKBOT_WEBHOOK_KEY` and the URL is `GVA_GROKBOT_WEBHOOK_URL`, both from `/etc/gva/gva.env`. The header name and prefix stay settable in `config.yaml` (`bot_bridge.key_header`, `bot_bridge.key_prefix`) if a routine uses another format. Quote the prefix so the trailing space stays:
 
 ```yaml
@@ -183,7 +187,7 @@ Then:
 
 1. Put the webhook URL and key in `/etc/gva/gva.env` (mode `0600`, owner `gva`). The names are in `gva.env.example`. Leave both blank to keep the bridge off.
 2. Leave `bot_bridge.key_header` and `bot_bridge.key_prefix` at the defaults unless Brenda's routine panel shows a different header. The defaults are `Authorization` and `Bearer `.
-3. Run `sudo gva doctor`. It prints `bridge: configured, milo_bot_answers reachable`, or `bridge: not configured`. It does not print the key or the webhook URL. If the table cannot be reached, that is a warning. The voice service still starts.
+3. Run `sudo gva doctor`. It prints `supabase: OK` when a read of `milo_bot_answers` succeeds, or `supabase: HTTP 401` (the status only) when it does not. It also prints `bridge: configured, milo_bot_answers reachable`, or `bridge: not configured`. It does not print the key, a row, or the webhook URL. A failed read is a warning. The voice service still starts.
 4. Run `sudo gva bridge test`. It sends a fixed harmless question and prints the webhook HTTP status and `answer: yes` or `answer: no`. It does not print the key or the answer text. A row it receives is marked read, so Milo does not say it again on the next wake.
 5. If `gva-voice` is already enabled, `deploy/update.sh` restarts it. Otherwise `sudo systemctl restart gva-voice`.
 

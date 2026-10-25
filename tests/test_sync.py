@@ -230,10 +230,75 @@ def test_config_change_apply_reject_and_rollback(tmp_path, monkeypatch):
     assert "threshold: 0.6" in text or "threshold: 0.60" in text
 
 
+def test_supabase_headers_match_the_key_style():
+    from gva.backend.supabase_headers import supabase_rest_headers
+
+    secret = "sb_secret_testkey"
+    headers = supabase_rest_headers(secret, prefer="return=minimal")
+    assert headers["apikey"] == secret
+    assert "Authorization" not in headers
+    assert headers["Prefer"] == "return=minimal"
+    assert headers["Content-Type"] == "application/json"
+
+    legacy = "service-test-key"
+    headers = supabase_rest_headers(legacy)
+    assert headers["apikey"] == legacy
+    assert headers["Authorization"] == "Bearer " + legacy
+
+    class Rec:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, headers=None, content=None):
+            self.calls.append(("post", headers))
+
+            class Response:
+                status_code = 201
+                text = ""
+
+            return Response()
+
+        def get(self, url, headers=None):
+            self.calls.append(("get", headers))
+
+            class Response:
+                status_code = 200
+                text = "[]"
+
+                def json(self):
+                    return []
+
+            return Response()
+
+        def patch(self, url, headers=None, content=None):
+            self.calls.append(("patch", headers))
+
+            class Response:
+                status_code = 204
+                text = ""
+
+            return Response()
+
+    http = Rec()
+    client = SupabaseRest("https://example.supabase.co", secret, http=http)
+    client.upsert("devices", [{"id": "d"}])
+    client.select("devices", "select=id&limit=1")
+    client.patch("devices", "id=eq.d", {"name": "n"})
+    assert http.calls
+    for _method, sent in http.calls:
+        assert sent["apikey"] == secret
+        assert "Authorization" not in sent
+
+    http = Rec()
+    client = SupabaseRest("https://example.supabase.co", legacy, http=http)
+    client.select("devices", "select=id&limit=1")
+    assert http.calls[0][1]["Authorization"] == "Bearer " + legacy
+
+
 def test_sync_error_hides_the_key():
     class Boom:
         status_code = 401
-        text = "service-" + ("s" * 24)
+        text = "sb_secret_testkey service-" + ("s" * 24)
 
         def json(self):
             return {}
@@ -244,6 +309,7 @@ def test_sync_error_hides_the_key():
         _raise_for_status(Boom(), "turns")
     except SyncError as exc:
         assert "service-" not in str(exc)
+        assert "sb_secret_" not in str(exc)
         assert "401" in str(exc)
     else:
         raise AssertionError("expected SyncError")

@@ -19,6 +19,7 @@ from gva.runtime.bridge import (
     bridge_configured,
     bridge_status,
     probe_answers,
+    supabase_doctor_line,
 )
 from gva.runtime.conversation import render_system
 from gva.runtime.realtime import RealtimeProtocol
@@ -209,6 +210,7 @@ def test_webhook_posts_polls_and_marks_the_row_read(monkeypatch, tmp_path):
     assert http.gets[0]["params"]["select"] == "request_id,answer,answered_by,read_at"
     assert http.gets[0]["headers"]["apikey"] == SERVICE_KEY
     assert http.gets[0]["headers"]["Authorization"] == "Bearer " + SERVICE_KEY
+    assert http.patches[0]["headers"]["Authorization"] == "Bearer " + SERVICE_KEY
     assert len(http.gets) == 2
     assert http.patches[0]["json"]["read_at"].endswith("Z")
     assert http.patches[0]["params"]["request_id"] == "eq." + body["request_id"]
@@ -496,6 +498,8 @@ def test_doctor_reports_bridge_without_secrets(monkeypatch, tmp_path):
     reachable, detail = probe_answers(cfg, http=ok_probe)
     assert reachable is True and detail == "ok"
     assert ok_probe.calls[0]["params"] == {"select": "request_id", "limit": "1"}
+    assert ok_probe.calls[0]["headers"]["apikey"] == SERVICE_KEY
+    assert ok_probe.calls[0]["headers"]["Authorization"] == "Bearer " + SERVICE_KEY
     assert "should-not-be-logged" not in detail
 
     missing = Probe(404)
@@ -519,6 +523,66 @@ def test_doctor_reports_bridge_without_secrets(monkeypatch, tmp_path):
     assert WEBHOOK_KEY not in "".join(presence.values())
 
 
+def test_new_secret_key_is_apikey_only(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    secret = "sb_secret_testkey"
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", secret)
+    http = FakeHttp()
+    http.rows = [{"request_id": "x", "answer": "ready", "answered_by": "Brenda", "read_at": None}]
+    _cfg, _store, _events, bridge = _bridge(tmp_path, http)
+    bridge.deliver = False
+    bridge.submit("hello", background=False)
+
+    assert http.posts[0]["headers"]["Authorization"] == "Bearer " + WEBHOOK_KEY
+    assert secret not in http.posts[0]["headers"]["Authorization"]
+    for call in http.gets + http.patches:
+        assert call["headers"]["apikey"] == secret
+        assert "Authorization" not in call["headers"]
+        assert secret not in json.dumps({k: v for k, v in call["headers"].items() if k != "apikey"})
+
+    class Probe:
+        def __init__(self, code):
+            self.code = code
+            self.calls = []
+
+        def get(self, url, params=None, headers=None, timeout=None):
+            self.calls.append({"params": params, "headers": headers})
+            return _Resp(self.code, [{"request_id": "row-secret", "answer": "personal"}])
+
+        def close(self):
+            return None
+
+    ok_probe = Probe(200)
+    cfg = Config()
+    reachable, detail = probe_answers(cfg, http=ok_probe)
+    assert reachable is True and detail == "ok"
+    assert ok_probe.calls[0]["headers"]["apikey"] == secret
+    assert "Authorization" not in ok_probe.calls[0]["headers"]
+    line, probed = supabase_doctor_line(cfg, probe=lambda _cfg: probe_answers(_cfg, http=Probe(200)))
+    assert line == "supabase: OK"
+    assert probed == (True, "ok")
+    assert secret not in line
+
+    denied, detail = probe_answers(cfg, http=Probe(401))
+    assert denied is False and detail == "HTTP 401"
+    line, probed = supabase_doctor_line(cfg, probe=lambda _cfg: (False, "HTTP 401"))
+    assert line == "supabase: HTTP 401"
+    assert probed == (False, "HTTP 401")
+    assert secret not in line
+    assert "row-secret" not in line
+    assert "personal" not in line
+
+    monkeypatch.delenv("GVA_GROKBOT_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("GVA_GROKBOT_WEBHOOK_KEY", raising=False)
+    sync_only = Config()
+    line, probed = supabase_doctor_line(sync_only, probe=lambda _cfg: (False, "HTTP 401"))
+    assert line == "supabase: HTTP 401"
+    bridge_line, warning = bridge_status(sync_only, probed=probed)
+    assert bridge_line == "bridge: not configured"
+    assert warning is None
+    assert secret not in line
+
+
 def test_example_files_document_the_bridge(monkeypatch):
     monkeypatch.setenv("GVA_ENV_FILE", "/no/such/gva.env")
     cfg = load_config(project_root() / "config" / "config.example.yaml")
@@ -537,6 +601,10 @@ def test_example_files_document_the_bridge(monkeypatch):
     assert "Brenda" in readme
     assert 'key_prefix: ""' in readme
     assert "no migration" in readme.lower()
+    assert "sb_secret_" in readme
+    assert "apikey" in readme
+    assert "supabase: OK" in readme
+    assert "sb_secret_" in example
     assert "—" not in readme
     assert "–" not in readme
 
@@ -588,6 +656,17 @@ def test_bridge_cli(monkeypatch, tmp_path):
     monkeypatch.setattr("gva.runtime.bridge.probe_answers", lambda cfg: (True, "ok"))
     doctor = CliRunner().invoke(app, ["doctor"])
     doctor_text = (doctor.output or "") + (getattr(doctor, "stderr", None) or "")
+    assert "supabase: OK" in doctor_text
     assert "bridge:" in doctor_text
     assert WEBHOOK_KEY not in doctor_text
+    assert SERVICE_KEY not in doctor_text
     assert "bridge-query" not in doctor_text
+
+    monkeypatch.setattr("gva.runtime.bridge.probe_answers", lambda cfg: (False, "HTTP 401"))
+    denied = CliRunner().invoke(app, ["doctor"])
+    denied_text = (denied.output or "") + (getattr(denied, "stderr", None) or "")
+    assert "supabase: HTTP 401" in denied_text
+    assert "milo_bot_answers is not reachable (HTTP 401)" in denied_text
+    assert SERVICE_KEY not in denied_text
+    assert WEBHOOK_KEY not in denied_text
+    assert not any(line.startswith("problem:") and "milo_bot_answers" in line for line in denied_text.splitlines())

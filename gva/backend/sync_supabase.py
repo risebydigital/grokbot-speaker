@@ -1,9 +1,10 @@
 """Push redacted telemetry to Supabase and apply pending config changes.
 
-The device uses the service-role key, which bypasses row-level security.
-That key is read from the environment at call time and is never written to a
-payload, a log line, or an exception message. The browser dashboard must use
-the anon key only.
+The device uses SUPABASE_SERVICE_KEY, which bypasses row-level security.
+A new ``sb_secret_`` key is sent only as the ``apikey`` header. A legacy
+service-role JWT is also sent as ``Authorization: Bearer``. The key is read
+from the environment at call time and is never written to a payload, a log
+line, or an exception message. The browser dashboard must use the anon key only.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import httpx
 
 from gva import __version__
 from gva.backend.schema_columns import ON_CONFLICT, fit
+from gva.backend.supabase_headers import supabase_rest_headers
 from gva.config import (
     Config,
     ConfigChangeError,
@@ -99,15 +101,7 @@ class SupabaseRest:
         _raise_for_status(response, table)
 
     def _headers(self, prefer: str | None = None) -> dict[str, str]:
-        headers = {
-            "apikey": self._key,
-            "Authorization": f"Bearer {self._key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        if prefer:
-            headers["Prefer"] = prefer
-        return headers
+        return supabase_rest_headers(self._key, prefer=prefer)
 
 
 def client_from_env(http: Any | None = None) -> SupabaseRest | None:

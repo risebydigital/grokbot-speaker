@@ -164,12 +164,16 @@ def doctor() -> None:
     """Check configuration, secrets, and directories before enabling systemd."""
     cfg = _cfg()
     problems, warnings = doctor_checks(cfg)
-    from gva.runtime.bridge import bridge_status
+    from gva.runtime.bridge import bridge_status, supabase_doctor_line
 
-    line, bridge_warning = bridge_status(cfg)
+    auth_line, probed = supabase_doctor_line(cfg)
+    typer.echo(auth_line)
+    line, bridge_warning = bridge_status(cfg, probed=probed)
     typer.echo(line)
     if bridge_warning:
         warnings = [*warnings, bridge_warning]
+    elif probed is not None and not probed[0]:
+        warnings = [*warnings, f"milo_bot_answers read returned {probed[1]}"]
     for warning in warnings:
         typer.echo(f"warning: {warning}")
     for problem in problems:
