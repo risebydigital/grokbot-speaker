@@ -1,0 +1,23 @@
+name: set_alarm
+description: >
+  Set an alarm for a clock time. Use for "at seven" or "tomorrow at 7".
+  Not for durations such as "in ten minutes" (use set_timer).
+timeout_s: 5
+risk: low
+personal_data: false
+parameters:
+  type: object
+  additionalProperties: false
+  required: [time]
+  properties:
+    time:
+      type: string
+      description: Local time as HH:MM, 24-hour.
+      pattern: "^[0-2][0-9]:[0-5][0-9]$"
+    day:
+      type: string
+      enum: [today, tomorrow]
+      description: Which day. Defaults to the next time that clock time occurs.
+    label:
+      type: string
+      maxLength: 40

@@ -1,0 +1,11 @@
+name: list_timers
+description: >
+  List running timers and how long is left. Use when the user asks how long is left
+  or what timers are set. Do not use to start a timer.
+timeout_s: 5
+risk: low
+personal_data: false
+parameters:
+  type: object
+  additionalProperties: false
+  properties: {}

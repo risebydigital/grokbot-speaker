@@ -1,0 +1,19 @@
+name: get_weather
+description: >
+  Get the weather forecast. If the user does not name a place, use the home location.
+  Do not invent a forecast if this tool fails.
+timeout_s: 5
+risk: low
+personal_data: false
+parameters:
+  type: object
+  additionalProperties: false
+  properties:
+    location:
+      type: string
+      maxLength: 80
+      description: Town or city. Omit to use the home location.
+    range:
+      type: string
+      enum: [today, tomorrow, weekend]
+      description: Which period to describe. Defaults to today.

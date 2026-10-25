@@ -1,0 +1,15 @@
+name: get_calendar_events
+description: >
+  Read the household calendar. Read at most three events aloud, soonest first.
+  If no calendar is connected, say so. Do not invent events.
+timeout_s: 5
+risk: low
+personal_data: true
+parameters:
+  type: object
+  additionalProperties: false
+  properties:
+    range:
+      type: string
+      enum: [today, tomorrow, tomorrow_morning, week]
+      description: When to look. Defaults to today.

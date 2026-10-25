@@ -1,0 +1,44 @@
+# Secrets. Real env files never belong in Git.
+.env
+.env.*
+!.env.example
+gva.env
+*.env
+!*.env.example
+!gva.env.example
+config/gva.env
+/etc/gva/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Runtime data
+.gva/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/var/
+
+# Models and audio (downloaded on the device, not committed)
+models/
+*.onnx
+*.onnx.json
+*.tflite
+*.wav
+*.mp3
+*.pcm
+
+# Editor
+.idea/
+.vscode/
+*.swp

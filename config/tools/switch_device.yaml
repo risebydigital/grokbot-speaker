@@ -1,0 +1,18 @@
+name: switch_device
+description: >
+  Turn a known home device on or off. Only use a device id from the enum.
+  If the user is vague ("the light"), ask which device.
+timeout_s: 5
+risk: medium
+personal_data: false
+parameters:
+  type: object
+  additionalProperties: false
+  required: [device, state]
+  properties:
+    device:
+      type: string
+      description: Device id from the household list.
+    state:
+      type: string
+      enum: ["on", "off"]

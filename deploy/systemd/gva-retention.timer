@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily GVA retention
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=gva-retention.service
+
+[Install]
+WantedBy=timers.target

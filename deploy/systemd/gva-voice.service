@@ -1,0 +1,28 @@
+[Unit]
+Description=Grok Voice Assistant speaker loop
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gva
+Group=gva
+SupplementaryGroups=audio
+WorkingDirectory=/opt/gva/app
+Environment=GVA_CONFIG=/etc/gva/config.yaml
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/gva/gva.env
+ExecStart=/opt/gva/venv/bin/gva run
+Restart=on-failure
+RestartSec=3
+StartLimitIntervalSec=120
+StartLimitBurst=5
+Nice=-5
+MemoryMax=2560M
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gva /var/log/gva /etc/gva /usr/share/gva
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

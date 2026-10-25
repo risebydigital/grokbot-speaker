@@ -1,0 +1,11 @@
+[Unit]
+Description=Backup the local GVA SQLite database
+
+[Service]
+Type=oneshot
+User=gva
+Group=gva
+ExecStart=/bin/sh -c 'install -d -o gva -g gva /var/lib/gva/backups && cp -a /var/lib/gva/metrics.db /var/lib/gva/backups/metrics-$(date -u +%%F).db'
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gva

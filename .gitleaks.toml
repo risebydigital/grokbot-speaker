@@ -1,0 +1,54 @@
+title = "GVA secret scan"
+
+[allowlist]
+description = "Placeholders and documentation"
+paths = [
+    '''gva\.env\.example''',
+    '''\.env\.example''',
+    '''supabase/migrations/.*''',
+]
+regexes = [
+    '''<YOUR_[A-Z0-9_]+>''',
+    '''<SUPABASE_[A-Z0-9_]+>''',
+    '''<64_HEX_CHARS[^>]*>''',
+    '''<RANDOM_SECRET[^>]*>''',
+    '''<SLACK_WEBHOOK[^>]*>''',
+    '''<HEALTHCHECK[^>]*>''',
+    '''<project-ref>''',
+]
+
+[[rules]]
+id = "gva-xai-key"
+description = "xAI API key"
+regex = '''xai-[A-Za-z0-9_\-]{16,}'''
+tags = ["key"]
+
+[[rules]]
+id = "gva-jwt"
+description = "JWT"
+regex = '''eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'''
+tags = ["jwt"]
+
+[[rules]]
+id = "gva-slack-webhook"
+description = "Slack webhook"
+regex = '''https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+'''
+tags = ["webhook"]
+
+[[rules]]
+id = "gva-aws"
+description = "AWS access key id"
+regex = '''AKIA[0-9A-Z]{16}'''
+tags = ["key"]
+
+[[rules]]
+id = "gva-github"
+description = "GitHub token"
+regex = '''ghp_[A-Za-z0-9]{20,}'''
+tags = ["key"]
+
+[[rules]]
+id = "gva-private-key"
+description = "PEM private key"
+regex = '''-----BEGIN [A-Z ]*PRIVATE KEY-----'''
+tags = ["key"]
