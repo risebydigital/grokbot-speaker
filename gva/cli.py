@@ -41,6 +41,7 @@ models_app = typer.Typer(help="Wake-word and voice downloads.")
 auth_app = typer.Typer(help="Local API tokens.")
 maintenance_app = typer.Typer(help="Retention and backups.")
 sync_app = typer.Typer(help="Supabase sync.")
+bridge_app = typer.Typer(help="Rise By Digital bot bridge.")
 app.add_typer(audio_app, name="audio")
 app.add_typer(config_app, name="config")
 app.add_typer(logs_app, name="logs")
@@ -49,6 +50,7 @@ app.add_typer(models_app, name="models")
 app.add_typer(auth_app, name="auth")
 app.add_typer(maintenance_app, name="maintenance")
 app.add_typer(sync_app, name="sync")
+app.add_typer(bridge_app, name="bridge")
 
 
 def _cfg():
@@ -162,6 +164,12 @@ def doctor() -> None:
     """Check configuration, secrets, and directories before enabling systemd."""
     cfg = _cfg()
     problems, warnings = doctor_checks(cfg)
+    from gva.runtime.bridge import bridge_status
+
+    line, bridge_warning = bridge_status(cfg)
+    typer.echo(line)
+    if bridge_warning:
+        warnings = [*warnings, bridge_warning]
     for warning in warnings:
         typer.echo(f"warning: {warning}")
     for problem in problems:
@@ -169,6 +177,29 @@ def doctor() -> None:
     if problems:
         raise typer.Exit(1)
     typer.echo("doctor: ok")
+
+
+@bridge_app.command("test")
+def bridge_test(question: str) -> None:
+    """Send one work question and wait for the team's answer."""
+    cfg = _cfg()
+    from gva.runtime.bridge import TIMEOUT_LINE, BotBridge, BridgeError, BridgeTimeout, bridge_configured
+
+    if not bridge_configured(cfg):
+        typer.echo("bridge: not configured", err=True)
+        raise typer.Exit(1)
+    store = _store(cfg)
+    events = _events(cfg, store)
+    bridge = BotBridge(cfg, events)
+    try:
+        answer = bridge.send_and_wait(question)
+    except BridgeTimeout:
+        typer.echo(TIMEOUT_LINE, err=True)
+        raise typer.Exit(1) from None
+    except BridgeError:
+        typer.echo("could not reach the team", err=True)
+        raise typer.Exit(1) from None
+    typer.echo(answer)
 
 
 @app.command()

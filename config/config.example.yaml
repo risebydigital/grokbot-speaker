@@ -206,3 +206,14 @@ retention:
   rollup_months: 13
   debug_audio_hours: 24
   heartbeat_days: 90
+
+# Work questions (Asana, reports, client work, calendar, email) go to the Grok Bot webhook.
+# Quick chat stays on the realtime session. The bridge turns on by itself when
+# GVA_GROKBOT_WEBHOOK_URL, GVA_GROKBOT_WEBHOOK_KEY, and Supabase are all set.
+bot_bridge:
+  enabled: true
+  timeout_s: 180
+  poll_s: 3
+  # Copy these from the Grok Bot routine panel. Quote the prefix so the trailing space stays.
+  key_header: Authorization
+  key_prefix: "Bearer "

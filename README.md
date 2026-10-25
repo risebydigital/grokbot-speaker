@@ -116,8 +116,65 @@ Non-secret settings live in `/etc/gva/config.yaml`, seeded from [`config/config.
 | `wake.threshold` | `0.6` | Score that counts as a hit |
 | `wake.patience_frames` | `2` | Hits in a row before the session opens |
 | `wake.cooldown_seconds` | `3` | Quiet time after a session |
+| `bot_bridge.enabled` | `true` | Off when false. Otherwise on once the webhook and Supabase are set |
+| `bot_bridge.timeout_s` | `180` | How long Milo waits for the team |
+| `bot_bridge.poll_s` | `3` | How often Milo checks for an answer |
+| `bot_bridge.key_header` | `Authorization` | Header name copied from the Grok Bot routine panel |
+| `bot_bridge.key_prefix` | `Bearer ` | Prefix copied from that panel, including the trailing space |
 
 Change an allow-listed key with `gva config set <key> <value>`. Secrets are rejected there. They belong only in the env file.
+
+## Bot bridge
+
+Quick chat stays on the xAI realtime session. A Rise By Digital work question (Asana tasks, reports that are due, client work, calendar, email) is handed to Adam's Grok Bot bots, which already have those connections. Milo does not answer that kind of question from the voice session.
+
+The bridge turns on by itself when all four of these are set:
+
+- `GVA_GROKBOT_WEBHOOK_URL`
+- `GVA_GROKBOT_WEBHOOK_KEY`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_KEY`
+
+`bot_bridge.enabled: false` forces it off even when those values are present. While it is off, the `ask_rbd_team` tool is not offered to the model.
+
+On a work question Milo makes a `request_id` and posts `{request_id, device_id, question, asked_at, reply_by}` to the webhook. The header name and prefix come from `bot_bridge.key_header` and `bot_bridge.key_prefix`. Copy both from the Grok Bot routine panel, and quote the prefix so a trailing space is kept (`key_prefix: "Bearer "`). The post times out after 10 seconds and is tried once more. The key is never written to the log. A query string on the webhook URL is never written either.
+
+Milo says it is checking with the team, then polls `public.milo_bot_answers` until the answer arrives or `bot_bridge.timeout_s` runs out. Polling continues after the voice session has closed and Milo is back on the wake word. When a row arrives, Milo reads it out. If the session is still open, it is spoken there. If the session has closed, Milo plays a short chime, then reads the text on a short realtime session (verbatim), or with Piper if that session cannot start. The row's `read_at` is filled in afterwards. If nothing arrives in time, Milo says: "Sorry, the team didn't get back to me in time. Try again in a bit."
+
+`bridge.sent`, `bridge.answered` (with `latency_ms`), `bridge.timeout`, and `bridge.error` go to the local event log and the on-device database. They are not uploaded with the voice-ops sync, and they do not contain the question or the answer.
+
+### One-off setup
+
+This repository does not create the table. Add it in the Supabase project (Lovable is a fine place to do that) before turning the bridge on. There is no migration for it here.
+
+`public.milo_bot_answers`
+
+| Column | Type |
+| --- | --- |
+| `request_id` | text, primary key |
+| `device_id` | text |
+| `answer` | text, not null |
+| `answered_by` | text |
+| `created_at` | timestamptz, default `now()` |
+| `read_at` | timestamptz |
+
+Row level security on, and only the service role may read or write. An edge function named `milo-answer` is what writes the rows when a bot replies.
+
+On the Pi, after this branch is on `main`:
+
+```bash
+cd ~/milo
+git pull --ff-only
+sudo bash deploy/update.sh
+```
+
+Then:
+
+1. Put the webhook URL and key in `/etc/gva/gva.env` (mode `0600`, owner `gva`). The names are in `gva.env.example`. Leave both blank to keep the bridge off.
+2. In `/etc/gva/config.yaml`, set `bot_bridge.key_header` and `bot_bridge.key_prefix` to the format from the Grok Bot routine panel.
+3. Run `gva doctor`. It prints `bridge: configured, milo_bot_answers reachable`, or `bridge: not configured`. It does not print the key or the webhook URL. If the table cannot be reached, that is a warning. The voice service still starts.
+4. Run `gva bridge test "What reports are due this week?"` and wait for the answer.
+5. If `gva-voice` is already enabled, `deploy/update.sh` restarts it. Otherwise `sudo systemctl restart gva-voice`.
 
 ## Troubleshooting
 

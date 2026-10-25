@@ -8,6 +8,7 @@ import httpx
 
 from gva.config import Config
 from gva.runtime.audio import SoundDeviceCapture, SoundDeviceSink, list_devices, prefer_output, resolve_device
+from gva.runtime.bridge import BotBridge, bridge_configured
 from gva.runtime.grok_client import GrokClient
 from gva.runtime.pipeline import VoiceAssistant
 from gva.runtime.realtime import RealtimeAssistant
@@ -38,7 +39,10 @@ def build_realtime(cfg: Config) -> RealtimeAssistant:
     )
     wake = _wake(cfg)
     tools = load_registry(cfg, store)
-    return RealtimeAssistant(cfg, store, events, capture, sink, wake, tools)
+    bridge = _bridge(cfg, events, sink, cfg.conversation.realtime.sample_rate)
+    if bridge is not None:
+        tools.ctx.bridge = bridge
+    return RealtimeAssistant(cfg, store, events, capture, sink, wake, tools, bridge=bridge)
 
 
 def build_local(cfg: Config) -> VoiceAssistant:
@@ -63,7 +67,16 @@ def build_local(cfg: Config) -> VoiceAssistant:
     tts = TtsRouter(cfg, PiperTts(cfg), XaiTts(cfg, http))
     grok = GrokClient(cfg, http=http)
     tools = load_registry(cfg, store, http=http)
+    bridge = _bridge(cfg, events, sink, cfg.audio.sample_rate)
+    if bridge is not None:
+        tools.ctx.bridge = bridge
     return VoiceAssistant(cfg, store, events, capture, sink, wake, vad, stt, tts, grok, tools)
+
+
+def _bridge(cfg: Config, events: EventLog, sink, rate: int) -> BotBridge | None:
+    if not bridge_configured(cfg):
+        return None
+    return BotBridge(cfg, events, sink=sink, pcm_rate=rate)
 
 
 def _telemetry(cfg: Config) -> tuple[Store, EventLog]:
