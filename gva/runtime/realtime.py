@@ -28,6 +28,7 @@ from typing import Any
 from gva.config import Config, env_value
 from gva.ids import new_ulid, utc_now_ms
 from gva.runtime.audio import FALLBACK_PHRASE, play_fallback_phrase, resample_pcm
+from gva.runtime.bridge import NOT_YET_LINE, UNREACHABLE_LINE, WAITING_LINE
 from gva.runtime.conversation import render_system
 from gva.runtime.textutil import is_stop_phrase
 from gva.telemetry.events import EventLog
@@ -95,6 +96,13 @@ class RealtimeProtocol:
         # A tool response often ends with no audio. The spoken reply is the next one.
         self._defer_silence_fallback = False
         self._need_response_create = False
+        self._bridge_ack_pending = False
+        self._bridge_ack_phrase = ""
+        self._response_instructions: str | None = None
+        self._response_active = False
+        self._bridge_items: list[dict[str, Any]] = []
+        self._bridge_inflight: dict[str, Any] | None = None
+        self._bridge_lock = __import__("threading").Lock()
         self.fallback_player = None
         self.session_id = new_ulid()
 
@@ -168,6 +176,7 @@ class RealtimeProtocol:
         if etype == "response.created":
             self.note_activity()
             self._turn_open = True
+            self._response_active = True
             self._response_pcm_bytes = 0
             self._response_id = event.get("response", {}).get("id") or event.get("response_id")
             return []
@@ -182,7 +191,16 @@ class RealtimeProtocol:
                 self._defer_silence_fallback = True
             self._finish_turn(event, status="ok", intent=None)
             if owe_reply:
-                return [{"type": "response.create"}]
+                message: dict[str, Any] = {"type": "response.create"}
+                instructions = self._response_instructions
+                self._response_instructions = None
+                if instructions:
+                    message["response"] = {"instructions": instructions}
+                    self._response_active = True
+                else:
+                    self._response_active = False
+                return [message]
+            self._response_active = False
             return []
         if etype == "response.function_call_arguments.done":
             self.note_activity()
@@ -278,6 +296,29 @@ class RealtimeProtocol:
         self.events.emit("tool.started", tool_name=name, tool_call_id=call_id)
         outcome = self.tools.run(call_id, name, arguments)
         self._tools.append(name)
+        if name in {"ask_rbd_team", "check_team_answer"}:
+            # Questions and answers are personal. Keep them out of the event log.
+            outcome.args_redacted = {}
+        if name == "ask_rbd_team":
+            if outcome.result.get("status") == "sent":
+                phrase = WAITING_LINE
+            else:
+                phrase = UNREACHABLE_LINE
+            self._bridge_ack_pending = True
+            self._bridge_ack_phrase = phrase
+            self._response_instructions = f"Say only: {phrase}"
+        elif name == "check_team_answer":
+            if outcome.result.get("status") == "ready":
+                phrase = str(outcome.result.get("answer") or "").strip() or NOT_YET_LINE
+                self._response_instructions = (
+                    "Read the team's answer out naturally and briefly, in British English. "
+                    "Do not add anything that is not in the answer."
+                )
+            else:
+                phrase = NOT_YET_LINE
+                self._response_instructions = f"Say only: {phrase}"
+            self._bridge_ack_pending = True
+            self._bridge_ack_phrase = phrase
         level = "info" if outcome.status == "ok" else "warning"
         if outcome.rejected:
             self.events.emit(
@@ -320,6 +361,8 @@ class RealtimeProtocol:
         audio_ms = _pcm_ms(self._response_pcm_bytes, rate)
         defer_fallback = self._defer_silence_fallback
         self._defer_silence_fallback = False
+        ack_pending = self._bridge_ack_pending
+        ack_phrase = self._bridge_ack_phrase
         if (
             self._turn_open is False
             and not self._user_text
@@ -332,10 +375,16 @@ class RealtimeProtocol:
             return
         fallback = False
         if status == "ok" and audio_ms == 0 and not defer_fallback:
-            extra = self._speak_fallback()
+            if ack_pending and ack_phrase:
+                self._bridge_ack_pending = False
+                extra = self._speak_phrase(ack_phrase)
+            else:
+                extra = self._speak_fallback()
             if extra:
                 fallback = True
                 audio_ms += extra
+        elif audio_ms > 0:
+            self._bridge_ack_pending = False
         usage = _usage(event)
         cost = self._account(usage, event)
         user = self._user_text
@@ -382,6 +431,77 @@ class RealtimeProtocol:
         self._tools = []
         self._turn_open = False
         self.events.ctx.turn_id = None
+
+    def bridge_blocked(self) -> bool:
+        """True while a response is open. A late answer waits, then speaks."""
+        return bool(self._response_active or self._need_response_create)
+
+    def enqueue_bridge(self, messages: list[dict[str, Any]], text: str) -> None:
+        with self._bridge_lock:
+            self._bridge_items.append({"messages": messages, "text": text, "sent": False})
+
+    def pop_bridge_ready(self) -> dict[str, Any] | None:
+        with self._bridge_lock:
+            if self._bridge_inflight is not None or self.bridge_blocked() or not self._bridge_items:
+                return None
+            self._bridge_inflight = self._bridge_items.pop(0)
+            return self._bridge_inflight
+
+    def finish_bridge_send(self, ok: bool) -> None:
+        with self._bridge_lock:
+            item = self._bridge_inflight
+            self._bridge_inflight = None
+            if item is None:
+                return
+            if ok:
+                item["sent"] = True
+                self._response_active = True
+            else:
+                self._bridge_items.insert(0, item)
+
+    def drain_unsent(self) -> list[str]:
+        with self._bridge_lock:
+            texts: list[str] = []
+            if self._bridge_inflight and not self._bridge_inflight.get("sent"):
+                texts.append(self._bridge_inflight["text"])
+                self._bridge_inflight = None
+            for item in self._bridge_items:
+                if not item.get("sent"):
+                    texts.append(item["text"])
+            self._bridge_items.clear()
+            return texts
+
+    def _speak_phrase(self, phrase: str) -> int:
+        """Speak one short line. A test player wins. Otherwise try Piper."""
+        player = self.fallback_player
+        if player is not None:
+            try:
+                result = player(self.sink, self.cfg, phrase)
+            except Exception:
+                return 0
+            if isinstance(result, bool):
+                return 1 if result else 0
+            try:
+                return max(0, int(result))
+            except (TypeError, ValueError):
+                return 0
+        try:
+            from gva.runtime.tts import PiperTts
+
+            pcm, rate = PiperTts(self.cfg).synthesise(phrase)
+        except Exception:
+            return 0
+        if not pcm:
+            return 0
+        target = int(getattr(self.sink, "sample_rate", 0) or self.cfg.conversation.realtime.sample_rate or rate)
+        if rate != target:
+            pcm = resample_pcm(pcm, rate, target)
+            rate = target
+        try:
+            self.sink.write(pcm)
+        except Exception:
+            return 0
+        return int(len(pcm) / 2 / max(rate, 1) * 1000)
 
     def _speak_fallback(self) -> int:
         player = self.fallback_player or play_fallback_phrase
@@ -507,7 +627,7 @@ def _safe(text: str) -> str:
 
 
 class RealtimeAssistant:
-    def __init__(self, cfg: Config, store: Store, events: EventLog, capture, sink, wake, tools, connector=None):
+    def __init__(self, cfg: Config, store: Store, events: EventLog, capture, sink, wake, tools, connector=None, bridge=None):
         self.cfg = cfg
         self.store = store
         self.events = events
@@ -516,6 +636,8 @@ class RealtimeAssistant:
         self.wake = wake
         self.tools = tools
         self.connector = connector
+        self.bridge = bridge
+        self._bridge_leftover: list[str] = []
         self.shutdown = __import__("threading").Event()
         self._last_heartbeat = time.monotonic()
         self.sessions = 0
@@ -551,6 +673,7 @@ class RealtimeAssistant:
                         retry_count=0,
                         fallback_spoken=False,
                     )
+                self._speak_bridge_leftover()
                 self.sessions += 1
                 self._after_session(time.monotonic() - started)
                 if max_sessions is not None and self.sessions >= max_sessions:
@@ -561,6 +684,14 @@ class RealtimeAssistant:
             close = getattr(self.sink, "close", None)
             if close:
                 close()
+
+    def _speak_bridge_leftover(self) -> None:
+        leftover = self._bridge_leftover
+        self._bridge_leftover = []
+        if self.bridge is None:
+            return
+        for text in leftover:
+            self.bridge.speak_closed(text, chime=True)
 
     def _wait_for_wake(self) -> bool:
         while not self.shutdown.is_set():
@@ -597,48 +728,82 @@ class RealtimeAssistant:
         url = voice.url.rstrip("/") + f"?model={voice.model}"
         protocol = RealtimeProtocol(self.cfg, self.events, self.store, self.tools, self.sink)
         self.events.ctx.session_id = protocol.session_id
-        aec = None
-        if self.cfg.audio.aec_enabled:
-            from gva.runtime.aec import AdaptiveEchoCanceller
+        if self.bridge is not None:
+            self.bridge.attach(protocol)
+            self.bridge.recall(deliver=True)
+        try:
+            aec = None
+            if self.cfg.audio.aec_enabled:
+                from gva.runtime.aec import AdaptiveEchoCanceller
 
-            aec = AdaptiveEchoCanceller(self.cfg.audio.aec_delay_ms, self.cfg.audio.sample_rate)
-        connect = self.connector or _default_connect
-        started = time.monotonic()
-        protocol.last_activity = started
-        protocol.last_socket = started
-        socket = connect(url, additional_headers={"Authorization": f"Bearer {key}"})
-        async with socket as ws:
-            await ws.send(json.dumps(protocol.session_update()))
-            player = asyncio.create_task(self._play_queued(protocol, aec))
-            sender = asyncio.create_task(self._send_audio(ws, protocol, aec))
-            watchdog = asyncio.create_task(self._watchdog(ws, protocol))
+                aec = AdaptiveEchoCanceller(self.cfg.audio.aec_delay_ms, self.cfg.audio.sample_rate)
+            connect = self.connector or _default_connect
+            started = time.monotonic()
+            protocol.last_activity = started
+            protocol.last_socket = started
+            socket = connect(url, additional_headers={"Authorization": f"Bearer {key}"})
+            async with socket as ws:
+                await self._run_socket(ws, protocol, aec, started)
+        finally:
+            protocol.close = True
+            if self.bridge is not None:
+                # Speak outside this event loop so a closed session can open a short one.
+                self._bridge_leftover = self.bridge.take_unsent(protocol)
+
+    async def _run_socket(self, ws, protocol: RealtimeProtocol, aec, started: float) -> None:
+        await ws.send(json.dumps(protocol.session_update()))
+        player = asyncio.create_task(self._play_queued(protocol, aec))
+        sender = asyncio.create_task(self._send_audio(ws, protocol, aec))
+        watchdog = asyncio.create_task(self._watchdog(ws, protocol))
+        bridge_tx = asyncio.create_task(self._send_bridge(ws, protocol))
+        try:
+            async for raw in ws:
+                protocol.note_socket()
+                if protocol.close:
+                    break
+                if isinstance(raw, bytes):
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                for message in protocol.on_event(event):
+                    if message.get("item", {}).get("type") == "message":
+                        protocol.note_text_message()
+                    await ws.send(json.dumps(message))
+                if protocol.close:
+                    break
+        finally:
+            protocol.close = True
+            for task in (sender, player, watchdog, bridge_tx):
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            protocol.finish_if_unbilled(time.monotonic() - started)
+            await _close_socket(ws)
+
+    async def _send_bridge(self, ws, protocol: RealtimeProtocol) -> None:
+        """Send a team's answer once the current response has finished."""
+        while not protocol.close:
+            item = protocol.pop_bridge_ready()
+            if item is None:
+                await asyncio.sleep(0.05)
+                continue
             try:
-                async for raw in ws:
-                    protocol.note_socket()
-                    if protocol.close:
-                        break
-                    if isinstance(raw, bytes):
-                        continue
-                    try:
-                        event = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    for message in protocol.on_event(event):
-                        if message.get("item", {}).get("type") == "message":
-                            protocol.note_text_message()
-                        await ws.send(json.dumps(message))
-                    if protocol.close:
-                        break
-            finally:
-                protocol.close = True
-                for task in (sender, player, watchdog):
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                protocol.finish_if_unbilled(time.monotonic() - started)
-                await _close_socket(ws)
+                if protocol.close:
+                    protocol.finish_bridge_send(False)
+                    return
+                for message in item["messages"]:
+                    await ws.send(json.dumps(message))
+                protocol.finish_bridge_send(True)
+            except asyncio.CancelledError:
+                protocol.finish_bridge_send(False)
+                raise
+            except Exception:
+                protocol.finish_bridge_send(False)
+                return
 
     async def _play_queued(self, protocol: RealtimeProtocol, aec) -> None:
         """Drain the playback queue on its own task so a slow device cannot stall the socket."""

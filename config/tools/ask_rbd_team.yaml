@@ -1,0 +1,18 @@
+name: ask_rbd_team
+description: >
+  Use this for Rise By Digital work questions: Asana tasks, reports due,
+  client work, Adam's calendar, and emails. Pass the question in the
+  caller's words. When the tool returns sent, say that you are checking
+  with the team, then wait. Everything else is answered directly, without
+  this tool.
+timeout_s: 25
+risk: low
+personal_data: true
+parameters:
+  type: object
+  additionalProperties: false
+  required: [question]
+  properties:
+    question:
+      type: string
+      description: The work question to send to the team.
