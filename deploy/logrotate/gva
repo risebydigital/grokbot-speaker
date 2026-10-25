@@ -1,0 +1,10 @@
+/var/log/gva/*.jsonl {
+    daily
+    rotate 30
+    missingok
+    notifempty
+    copytruncate
+    compress
+    delaycompress
+    su gva gva
+}

@@ -1,0 +1,204 @@
+# /etc/gva/config.yaml
+# No secrets in this file. Keys live in /etc/gva/gva.env (mode 0600, owner gva).
+
+device:
+  id: milo-01
+  name: Milo
+  timezone: Europe/London
+  env: prod
+  # Used for weather when the speaker does not name a place.
+  default_location: "Nottingham, UK"
+
+audio:
+  # Substring matched against ALSA / sounddevice names. Run `gva audio devices`.
+  # AIRHUG is a plain USB microphone (no hardware echo cancellation).
+  input_device: "AIRHUG"
+  # Empty means auto: a USB playback device (the Sanyun SW208), then the 3.5 mm jack.
+  # Bluetooth is never chosen. Set a substring only if auto picks the wrong card.
+  output_device: ""
+  # AIRHUG's native rate. Wake and the realtime socket resample from this.
+  capture_rate: 48000
+  sample_rate: 16000
+  chunk_ms: 80
+  # Single-delay software echo attenuation. There is no hardware AEC on this kit.
+  aec_enabled: true
+  aec_delay_ms: 80
+
+wake:
+  engine: openwakeword
+  # Pretrained model name, or an absolute path to a custom ONNX file.
+  # Out of the box this is openWakeWord's "hey_jarvis" model: say "hey jarvis".
+  # After you train Milo, set model to /usr/share/gva/wake/milo.onnx (or hey_milo.onnx).
+  model: hey_jarvis
+  phrase: "hey jarvis"
+  model_dir: /usr/share/gva/wake
+  threshold: 0.6
+  patience_frames: 2
+  refractory_seconds: 2.0
+  cooldown_seconds: 3.0
+  vad_gate: true
+  pre_roll_ms: 300
+  # Optional second openWakeWord model that means "stop". Leave empty until you train one.
+  stop_model: ""
+
+vad:
+  # silero (via openWakeWord's ONNX model) when installed, otherwise energy.
+  engine: silero
+  end_silence_ms: 800
+  max_utterance_seconds: 12
+  energy_threshold: 500
+
+stt:
+  # Pi 4 / 4 GB: base.en int8, beam 1. The brief's small.en is for a Pi 5.
+  engine: faster_whisper
+  model: base.en
+  compute_type: int8
+  beam_size: 1
+  cpu_threads: 2
+  language: en
+  min_confidence: 0.45
+  # Whisper often emits these on near-silence. Matched after case-folding.
+  hallucinations:
+    - "thank you."
+    - "thank you"
+    - "thanks for watching."
+    - "thanks for watching"
+    - "subtitles by"
+    - "subscribe"
+  xai:
+    model: grok-voice-transcribe-2.0
+    keyterms: ["Milo", "Rise By Digital"]
+    # Audio leaves the device only when this is true.
+    allow_cloud_fallback: false
+
+llm:
+  base_url: https://api.x.ai/v1
+  model: grok-4.7
+  # Used only after the daily soft cap. Pick a cheaper model from the xAI pricing page.
+  fallback_model: grok-4.3
+  reasoning_effort: null
+  temperature: 0.4
+  max_completion_tokens: 300
+  parallel_tool_calls: false
+  max_tool_rounds: 3
+  history_messages: 6
+  history_token_budget: 1500
+  timeouts:
+    connect_s: 3
+    read_s: 10
+    stream_idle_s: 5
+  retry:
+    max_attempts: 3
+    base_s: 0.5
+    cap_s: 4
+  circuit_breaker:
+    failures: 5
+    window_s: 60
+    open_s: 30
+  system_prompt_version: v3
+  user_agent: gva/0.1.0
+
+tts:
+  engine: piper
+  # Low-quality British voice so a Pi 4 can start speaking inside the latency budget.
+  # en_GB-alba-medium sounds fuller if `gva doctor` shows the Pi keeping up.
+  voice: en_GB-alan-low
+  model_dir: /usr/share/gva/voices
+  speaking_rate: 1.0
+  pronunciation:
+    Grok: "Grock"
+  xai:
+    voice_id: eve
+    enabled: false
+
+conversation:
+  # realtime: one WebSocket to grok-voice-latest (the path this Pi uses).
+  # local: faster-whisper, then Grok chat, then Piper.
+  engine: realtime
+  realtime:
+    model: grok-voice-latest
+    voice: eve
+    url: wss://api.x.ai/v1/realtime
+    sample_rate: 24000
+    silence_duration_ms: 800
+    # Hang up when the server has been quiet for this long. Microphone noise does not reset it.
+    silence_timeout_s: 15
+    watchdog_s: 30
+    audio_usd_per_minute: 0.08
+    text_usd_per_message: 0.004
+  follow_up_seconds: 6
+  session_idle_minutes: 10
+  turn_budget_seconds: 8
+  # wake_and_stop: wake word barges in immediately; "stop" / "cancel" / "never mind"
+  # halt playback immediately and are confirmed locally (no Grok call).
+  barge_in: wake_and_stop
+  energy_barge_in: true
+  barge_in_min_ms: 280
+  stop_phrases: ["stop", "cancel", "never mind", "nevermind", "be quiet", "shut up"]
+
+led:
+  enabled: false
+  pin: 18
+
+home:
+  devices:
+    - id: kitchen_lights
+      name: Kitchen lights
+      kinds: [switch]
+    - id: desk_lamp
+      name: Desk lamp
+      kinds: [switch, level]
+
+privacy:
+  household_names: []
+  # Local JSONL keeps short numbers by default. Sync always redacts them.
+  redact_short_numbers: false
+  sync_redact_short_numbers: true
+  hash_epoch: 1
+  sensitive_categories:
+    health: ["doctor", "hospital", "medication", "prescription", "symptom", "cancer", "pregnant", "nhs", "depression", "anxiety", "diagnosis"]
+    finance: ["salary", "mortgage", "sort code", "bank account", "invoice", "overdraft", "national insurance"]
+    children: ["my child", "my son", "my daughter", "my kid", "school run"]
+
+telemetry:
+  log_dir: /var/log/gva
+  db_path: /var/lib/gva/metrics.db
+  schema_version: "1.0.0"
+  heartbeat_seconds: 60
+  validate_events: true
+  # Hours to keep raw text locally so `gva replay` can re-run a turn. 0 disables it.
+  # Never synced. Never written to Supabase.
+  replay_cache_hours: 0
+  debug_audio: false
+  debug_audio_dir: /var/lib/gva/debug-audio
+
+budget:
+  monthly_usd: null
+  daily_soft_cap_usd: null
+  fx_usd_gbp: null
+  # Used only when the API omits cost_in_usd_ticks. Figures from docs.x.ai on 25 October 2026
+  # for grok-4.7 prompts under 200k tokens. Replace them if xAI changes the price.
+  prices_per_mtok_usd:
+    input: 2.00
+    cached_input: 0.50
+    output: 6.00
+
+sync:
+  enabled: true
+  interval_seconds: 15
+  batch_size: 500
+  # How long a dashboard config change is watched before it is considered stable.
+  rollback_seconds: 300
+
+backend:
+  host: 127.0.0.1
+  port: 8080
+  # Option C only. The Lovable dashboard does not call this; it reads Supabase.
+  dashboard_origin: "https://voice-ops.example.com"
+  docs_enabled: false
+
+retention:
+  events_days: 30
+  rollup_months: 13
+  debug_audio_hours: 24
+  heartbeat_days: 90

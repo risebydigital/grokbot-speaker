@@ -1,0 +1,15 @@
+name: cancel_timer
+description: >
+  Cancel a running timer. Use when the user asks to cancel, stop, or clear a timer.
+  If they do not name one and several are running, ask which one.
+timeout_s: 5
+risk: low
+personal_data: false
+parameters:
+  type: object
+  additionalProperties: false
+  properties:
+    label:
+      type: string
+      maxLength: 40
+      description: Label of the timer to cancel. Omit to cancel the only running timer.

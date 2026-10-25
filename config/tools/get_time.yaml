@@ -1,0 +1,15 @@
+name: get_time
+description: >
+  Read the current local time or date. Use when the user asks the time or the date.
+  Prefer this over guessing.
+timeout_s: 2
+risk: low
+personal_data: false
+parameters:
+  type: object
+  additionalProperties: false
+  properties:
+    what:
+      type: string
+      enum: [time, date, both]
+      description: What to read out. Defaults to time.

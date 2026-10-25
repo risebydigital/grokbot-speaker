@@ -1,0 +1,15 @@
+[Unit]
+Description=Grok Voice Assistant local retention
+
+[Service]
+Type=oneshot
+User=gva
+Group=gva
+WorkingDirectory=/opt/gva/app
+Environment=GVA_CONFIG=/etc/gva/config.yaml
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/gva/gva.env
+ExecStart=/opt/gva/venv/bin/gva maintenance retention
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gva /var/log/gva

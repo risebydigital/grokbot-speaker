@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily GVA database backup
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+Unit=gva-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,25 @@
+[Unit]
+Description=Grok Voice Assistant Supabase sync
+After=network-online.target
+
+[Service]
+Type=simple
+User=gva
+Group=gva
+WorkingDirectory=/opt/gva/app
+Environment=GVA_CONFIG=/etc/gva/config.yaml
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/gva/gva.env
+ExecStart=/opt/gva/venv/bin/gva sync run
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+MemoryMax=512M
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gva /var/log/gva /etc/gva
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+name: set_timer
+description: >
+  Start a countdown timer. Use when the user asks for a timer or to be reminded
+  after a duration. Not for clock-time alarms (use set_alarm).
+timeout_s: 5
+risk: low
+personal_data: false
+parameters:
+  type: object
+  additionalProperties: false
+  required: [duration_seconds]
+  properties:
+    duration_seconds:
+      type: integer
+      minimum: 1
+      maximum: 86400
+      description: Timer length in seconds. Convert minutes and hours to seconds.
+    label:
+      type: string
+      maxLength: 40
+      description: Optional short name, for example pasta.

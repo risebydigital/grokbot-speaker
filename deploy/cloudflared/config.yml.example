@@ -1,0 +1,10 @@
+# Example only. The install script does not start cloudflared and does not
+# open the local API to the internet. The ops dashboard reads Supabase.
+#
+# tunnel: <tunnel-id>
+# credentials-file: /etc/cloudflared/<tunnel-id>.json
+#
+# ingress:
+#   - hostname: voice-ops.example.com
+#     service: http://127.0.0.1:8080
+#   - service: http_status:404

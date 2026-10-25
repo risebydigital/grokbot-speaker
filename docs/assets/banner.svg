@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-label="Milo, a Grok Voice speaker by Rise By Digital">
+  <rect width="1200" height="320" fill="#052A48"/>
+  <rect y="308" width="1200" height="12" fill="#00A897"/>
+  <g transform="translate(78,78)" fill="none" stroke="#00A897" stroke-width="8" stroke-linecap="round">
+    <rect x="8" y="36" width="64" height="128" rx="8" fill="#00A897" stroke="none"/>
+    <circle cx="40" cy="100" r="22" fill="#052A48" stroke="none"/>
+    <circle cx="40" cy="100" r="8" fill="#00A897" stroke="none"/>
+    <path d="M92 58c28 18 28 66 0 84"/>
+    <path d="M116 40c40 26 40 94 0 120"/>
+    <path d="M140 22c52 34 52 128 0 162"/>
+  </g>
+  <text x="360" y="156" fill="#FFFFFF" font-family="Roboto, ui-sans-serif, system-ui, sans-serif" font-size="92" font-weight="700">Milo</text>
+  <text x="364" y="206" fill="#00A897" font-family="Roboto, ui-sans-serif, system-ui, sans-serif" font-size="28">A Grok Voice speaker</text>
+  <text x="364" y="246" fill="#FFFFFF" font-family="Roboto, ui-sans-serif, system-ui, sans-serif" font-size="20" opacity="0.85">Rise By Digital</text>
+</svg>

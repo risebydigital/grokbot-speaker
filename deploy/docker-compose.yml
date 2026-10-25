@@ -1,0 +1,25 @@
+# Optional. The voice loop stays on the Pi host so it can see ALSA.
+# This file only runs the local API, for a machine that already has the checkout.
+
+services:
+  gva-backend:
+    image: python:3.12-slim
+    working_dir: /opt/gva/app
+    volumes:
+      - ../:/opt/gva/app:ro
+      - gva-data:/var/lib/gva
+    environment:
+      GVA_CONFIG: /opt/gva/app/config/config.example.yaml
+      GVA_DB_PATH: /var/lib/gva/metrics.db
+      GVA_LOG_DIR: /var/lib/gva/log
+    env_file:
+      - /etc/gva/gva.env
+    command: >
+      sh -c "pip install -e /opt/gva/app &&
+             uvicorn gva.backend.app:app --host 127.0.0.1 --port 8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+
+volumes:
+  gva-data:

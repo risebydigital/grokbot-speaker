@@ -1,0 +1,21 @@
+name: update_timer
+description: >
+  Change the length of a running timer. Use when the user corrects a duration
+  ("no, make it fifteen minutes").
+timeout_s: 5
+risk: low
+personal_data: false
+parameters:
+  type: object
+  additionalProperties: false
+  required: [duration_seconds]
+  properties:
+    duration_seconds:
+      type: integer
+      minimum: 1
+      maximum: 86400
+      description: New length in seconds from now.
+    label:
+      type: string
+      maxLength: 40
+      description: Label of the timer to change. Omit to change the only running timer.
