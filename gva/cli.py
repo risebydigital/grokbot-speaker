@@ -284,7 +284,13 @@ def test_audio(seconds: float = typer.Option(2.0, "--seconds", help="How long th
         raise typer.Exit(1)
     name = next((row["name"] for row in rows if row.get("index") == index), str(index))
     rate = cfg.conversation.realtime.sample_rate if cfg.conversation.engine == "realtime" else cfg.audio.sample_rate
-    sink = SoundDeviceSink(index, rate)
+    sink = SoundDeviceSink(
+        index,
+        rate,
+        prebuffer_ms=cfg.audio.playback_prebuffer_ms,
+        latency=cfg.audio.output_latency,
+        blocksize=cfg.audio.output_blocksize,
+    )
     try:
         sink.prepare()
         typer.echo(
@@ -322,7 +328,8 @@ def chime_test() -> None:
         index,
         rate,
         prebuffer_ms=cfg.audio.playback_prebuffer_ms,
-        latency=cfg.audio.playback_latency,
+        latency=cfg.audio.output_latency,
+        blocksize=cfg.audio.output_blocksize,
     )
     try:
         sink.prepare()
@@ -338,6 +345,18 @@ def chime_test() -> None:
     finally:
         sink.close()
     typer.echo("done")
+
+
+@audio_app.command("stats")
+def audio_stats() -> None:
+    """Open the speaker and microphone and report the buffer, plus logged underruns."""
+    cfg = _cfg()
+    from gva.runtime.audio import probe_opened_streams, render_audio_stats
+
+    store = _store(cfg)
+    events, samples = store.underrun_totals()
+    output, output_error, capture, capture_error = probe_opened_streams(cfg)
+    typer.echo(render_audio_stats(cfg, output, output_error, capture, capture_error, events, samples))
 
 
 @audio_app.command("devices")

@@ -36,7 +36,8 @@ def build_realtime(cfg: Config) -> RealtimeAssistant:
         _output_index(cfg),
         cfg.conversation.realtime.sample_rate,
         prebuffer_ms=cfg.audio.playback_prebuffer_ms,
-        latency=cfg.audio.playback_latency,
+        latency=cfg.audio.output_latency,
+        blocksize=cfg.audio.output_blocksize,
     )
     wake = _wake(cfg)
     tools = load_registry(cfg, store)
@@ -55,7 +56,8 @@ def build_local(cfg: Config) -> VoiceAssistant:
         _output_index(cfg),
         cfg.audio.sample_rate,
         prebuffer_ms=cfg.audio.playback_prebuffer_ms,
-        latency=cfg.audio.playback_latency,
+        latency=cfg.audio.output_latency,
+        blocksize=cfg.audio.output_blocksize,
     )
     wake = _wake(cfg)
     energy = EnergyVad(cfg.vad.energy_threshold)
@@ -116,6 +118,8 @@ def _capture(cfg: Config, events: EventLog, sample_rate: int) -> SoundDeviceCapt
         sample_rate,
         cfg.audio.chunk_ms,
         on_error=on_error,
+        latency=cfg.audio.capture_latency,
+        blocksize=cfg.audio.capture_blocksize,
     )
 
 

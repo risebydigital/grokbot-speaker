@@ -108,6 +108,10 @@ def test_playback_config_defaults():
     cfg = load_config(project_root() / "config" / "config.example.yaml")
     assert cfg.audio.playback_prebuffer_ms == 250
     assert cfg.audio.playback_latency == "high"
+    assert cfg.audio.output_latency == 0.2
+    assert cfg.audio.output_blocksize == 2400
+    assert cfg.audio.capture_latency == 0.2
+    assert cfg.audio.capture_blocksize == 2400
 
 
 def _stack(tmp_path):

@@ -186,6 +186,21 @@ class Store:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def underrun_totals(self) -> tuple[int, int]:
+        """Count playback.underrun events and the sum of their underrun samples."""
+        try:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(json_extract(body, '$.underruns')), 0) AS samples "
+                "FROM events WHERE type = 'playback.underrun'"
+            ).fetchone()
+            return int(row["n"] or 0), int(row["samples"] or 0)
+        except Exception:
+            events = self.recent("playback.underrun", limit=10000)
+            samples = 0
+            for item in events:
+                samples += int(item.get("underruns") or item.get("count") or 0)
+            return len(events), samples
+
     def recent(self, type_: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         if type_:
             rows = self._conn.execute(

@@ -37,8 +37,16 @@ class AudioConfig(BaseModel):
     # 250 ms sits in the 200-300 ms range that keeps a USB speaker from stuttering.
     # After an underrun the buffer fills to this depth again before sound resumes.
     playback_prebuffer_ms: int = 250
-    # PortAudio hint. "high" suits the Sanyun USB card. "low" is the other allowed value.
+    # PortAudio hint kept so older config files still load. The stream uses output_latency.
     playback_latency: Literal["high", "low"] = "high"
+    # Seconds of device buffer, or the names "high" and "low". 0.2 is about 200 ms.
+    # On the USB speaker, "high" alone still opened a 60 ms buffer.
+    output_latency: float | Literal["high", "low"] = 0.2
+    # Callback period in frames at 48 kHz. 2400 frames is 50 ms. Scaled to the device rate.
+    output_blocksize: int = Field(default=2400, ge=256, le=9600)
+    # Microphone. The period stays at least one wake chunk. Latency matches the speaker.
+    capture_latency: float | Literal["high", "low"] = 0.2
+    capture_blocksize: int = Field(default=2400, ge=256, le=9600)
     # 1 is the approved chime at peak 18000. Loud enough for a room, and under clipping.
     chime_volume: float = Field(default=1.0, ge=0.0, le=1.0)
 
@@ -522,6 +530,14 @@ def _number(kind: type, low: float, high: float):
     return check
 
 
+def _latency(value: Any) -> float | str:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"high", "low"}:
+            return text
+    return _number(float, 0.05, 1.0)(value)
+
+
 def _text(value: Any) -> str:
     text = str(value).strip()
     if not text or len(text) > 200:
@@ -564,6 +580,10 @@ CHANGE_RULES = {
     "action.health_check": _as_bool,
     "bot_bridge.max_suggestions": _number(int, 1, 8),
     "audio.chime_volume": _number(float, 0, 1),
+    "audio.output_latency": _latency,
+    "audio.output_blocksize": _number(int, 256, 9600),
+    "audio.capture_latency": _latency,
+    "audio.capture_blocksize": _number(int, 256, 9600),
 }
 
 
