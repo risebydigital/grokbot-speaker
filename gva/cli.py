@@ -42,6 +42,7 @@ auth_app = typer.Typer(help="Local API tokens.")
 maintenance_app = typer.Typer(help="Retention and backups.")
 sync_app = typer.Typer(help="Supabase sync.")
 bridge_app = typer.Typer(help="Rise By Digital bot bridge.")
+chime_app = typer.Typer(help="Milo's chime.")
 app.add_typer(audio_app, name="audio")
 app.add_typer(config_app, name="config")
 app.add_typer(logs_app, name="logs")
@@ -51,6 +52,7 @@ app.add_typer(auth_app, name="auth")
 app.add_typer(maintenance_app, name="maintenance")
 app.add_typer(sync_app, name="sync")
 app.add_typer(bridge_app, name="bridge")
+app.add_typer(chime_app, name="chime")
 
 
 def _cfg():
@@ -291,6 +293,45 @@ def test_audio(seconds: float = typer.Option(2.0, "--seconds", help="How long th
         )
         sink.write(tone(int(seconds * 1000), freq=440, amp=8000, sample_rate=rate))
         time.sleep(seconds + 0.4)
+    except Exception as exc:
+        typer.echo(f"playback failed: {exc.__class__.__name__}: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    finally:
+        sink.close()
+    typer.echo("done")
+
+
+@chime_app.command("test")
+def chime_test() -> None:
+    """Play Milo's chime once on the speaker he will use."""
+    cfg = _cfg()
+    from gva.runtime.audio import SoundDeviceSink, list_devices, prefer_output
+    from gva.runtime.chime import DURATION_S, play_chime
+
+    rows = list_devices()
+    if rows and rows[0].get("error"):
+        typer.echo(rows[0]["error"], err=True)
+        raise typer.Exit(1)
+    index = prefer_output(rows, cfg.audio.output_device)
+    if index is None:
+        typer.echo("no playback device found. Run: gva audio devices", err=True)
+        raise typer.Exit(1)
+    name = next((row["name"] for row in rows if row.get("index") == index), str(index))
+    rate = cfg.conversation.realtime.sample_rate if cfg.conversation.engine == "realtime" else cfg.audio.sample_rate
+    sink = SoundDeviceSink(
+        index,
+        rate,
+        prebuffer_ms=cfg.audio.playback_prebuffer_ms,
+        latency=cfg.audio.playback_latency,
+    )
+    try:
+        sink.prepare()
+        typer.echo(
+            f"playing the chime on [{index}] {name} "
+            f"(device {sink.device_rate} Hz, {sink.channels} ch, volume {cfg.audio.chime_volume:.2f})"
+        )
+        play_chime(sink, cfg, raise_errors=True)
+        time.sleep(DURATION_S + 0.6)
     except Exception as exc:
         typer.echo(f"playback failed: {exc.__class__.__name__}: {exc}", err=True)
         raise typer.Exit(1) from exc

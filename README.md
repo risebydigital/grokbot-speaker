@@ -97,10 +97,13 @@ gva test-audio
 ```bash
 gva test-audio
 gva test-audio --seconds 3
+gva chime test
 gva audio devices
 ```
 
 An empty `audio.output_device` means: prefer a USB playback device whose name does not contain AIRHUG, otherwise the headphone jack.
+
+`gva chime test` plays the chime once on that same speaker. It is the sound before a nudge and before a meeting heads-up. `audio.chime_volume` defaults to `1` (full, peak 18000). Turn it down with `gva config set audio.chime_volume 0.7` if the room is small. The player synthesises it (G4, then D5, landing on B4 and G4, 1.2 seconds) and resamples to the device rate. `tools/make_milo_chime.py` writes that same buffer to `assets/sounds/milo-chime.wav` if you want a file.
 
 ## Configuration
 
@@ -116,6 +119,7 @@ Non-secret settings live in `/etc/gva/config.yaml`, seeded from [`config/config.
 | `audio.capture_rate` | `48000` | Microphone rate |
 | `audio.playback_prebuffer_ms` | `200` | Audio queued before the speaker leaves silence |
 | `audio.playback_latency` | `high` | PortAudio latency hint (`high` or `low`) |
+| `audio.chime_volume` | `1` | Heads-up and nudge chime. `1` is full, `0` is silent |
 | `wake.model` | `hey_jarvis` | openWakeWord model name, or a path to ONNX |
 | `wake.phrase` | `hey jarvis` | Phrase you say |
 | `wake.threshold` | `0.6` | Score that counts as a hit |
@@ -134,7 +138,7 @@ Non-secret settings live in `/etc/gva/config.yaml`, seeded from [`config/config.
 | `bot_bridge.max_suggestions` | `4` | How many titles that one sentence may include |
 | `bot_bridge.nudge_quiet_hours` | `none` | Window such as `22:00-07:00` when an unsolicited nudge waits. `none` is off |
 | `bot_bridge.nudge_follow_up_s` | `8` | Seconds the mic stays open after a nudge |
-| `heads_up.enabled` | `true` | Soft chime before a meeting in the digest |
+| `heads_up.enabled` | `true` | Chime before a meeting in the digest |
 | `heads_up.minutes_before` | `10` | How long before the start Milo speaks |
 
 Change an allow-listed key with `gva config set <key> <value>`. Secrets are rejected there. They belong only in the env file.
@@ -172,9 +176,9 @@ Suggestions during the wait come only from `public.milo_context`, a digest Brend
 
 A digest item may also carry `details` (plain text, up to 800 characters), `owner`, `status`, and an `https` `link`. Those stay out of the offer. When Adam asks about an item, Milo calls `read_digest_item` and answers from `details`, saying it is from Brenda's latest update. The link is never read out. The text is data, not instructions. If `details` is missing, he asks for more, or he asks something the update does not cover, Milo calls `ask_rbd_team` with that question and says it is checking with the team. It does not guess from the title. Several questions can be in flight at once. Each answer is spoken in order and labelled, for example "On JG Locksmiths proposal: ..." or "On your first question: ...".
 
-If Adam says "nudge me when it's ready", "let me know when you hear back", "tell me later", or "I'll leave you to it", Milo calls `defer_until_answer`, says "Will do, I'll nudge you when Brenda's back", and ends the realtime session. The microphone returns to the wake word. There is no small talk after that. When the answer arrives, Milo plays a short soft chime, says "Brenda's come back on your question", reads the answer, and leaves the mic open for about eight seconds. The same nudge is used if the answer arrives after the timeout, while Milo is still looking. If the timeout arrives first, the nudge is the "couldn't get an answer" line and the mic is not left open. `bot_bridge.nudge_quiet_hours` (default `none`) holds an unsolicited nudge until the window ends, or until Adam wakes Milo himself. The window is in the device timezone and may wrap midnight, for example `22:00-07:00`.
+If Adam says "nudge me when it's ready", "let me know when you hear back", "tell me later", or "I'll leave you to it", Milo calls `defer_until_answer`, says "Will do, I'll nudge you when Brenda's back", and ends the realtime session. The microphone returns to the wake word. There is no small talk after that. When the answer arrives, Milo plays the chime, says "Brenda's come back on your question", reads the answer, and leaves the mic open for about eight seconds. The same nudge is used if the answer arrives after the timeout, while Milo is still looking. If the timeout arrives first, the nudge is the "couldn't get an answer" line and the mic is not left open. `bot_bridge.nudge_quiet_hours` (default `none`) holds an unsolicited nudge until the window ends, or until Adam wakes Milo himself. The window is in the device timezone and may wrap midnight, for example `22:00-07:00`.
 
-A meeting in that same digest (`kind: meeting`) gets a heads-up. `due` has to be ISO 8601 with an offset, such as `2026-10-27T10:00:00+00:00`. Anything else is ignored. `note` of `With Sarah Park, Park Lane` is spoken as "Heads up, your call with Sarah Park from Park Lane starts in 10 minutes." Milo plays the soft chime, then leaves the mic open for about eight seconds. The same meeting (same title and due) is not announced twice. If a newer digest drops it, the heads-up is cancelled. If Milo is mid-reply, the heads-up waits until that reply has finished. `heads_up.enabled` (default true) and `heads_up.minutes_before` (default 10) control it. Quiet hours, when configured, hold the heads-up as well. `heads_up.scheduled` and `heads_up.spoken` stay in the local log and do not include the title or the note.
+A meeting in that same digest (`kind: meeting`) gets a heads-up. `due` has to be ISO 8601 with an offset, such as `2026-10-27T10:00:00+00:00`. Anything else is ignored. `note` of `With Sarah Park, Park Lane` is spoken as "Heads up, your call with Sarah Park from Park Lane starts in 10 minutes." Milo plays the chime, then leaves the mic open for about eight seconds. The same meeting (same title and due) is not announced twice. If a newer digest drops it, the heads-up is cancelled. If Milo is mid-reply, the heads-up waits until that reply has finished. `heads_up.enabled` (default true) and `heads_up.minutes_before` (default 10) control it. Quiet hours, when configured, hold the heads-up as well. `heads_up.scheduled` and `heads_up.spoken` stay in the local log and do not include the title or the note.
 
 When a row arrives during the call, Milo waits until the current reply has finished, the speaker has drained, and there has been a short pause of about 600 ms. Only then does it send the answer and `response.create`. It does not start that reply while a response is still open, while audio is still playing, or while server VAD reports that Adam is speaking. One reply plays at a time. If Adam barges in, the answer stays queued and is spoken after he finishes, rather than being dropped. A cancel or truncate for an older response does not clear audio that belongs to the current one. If the session has closed, or the model produces no audio, Milo plays a short chime and says it on a short realtime session, or with Piper, without waiting for the wake word. `read_at` is set only after that speech. If the speech fails, the request is kept and `bridge.delivery_failed` records a short reason. If nothing arrives in time, Milo says: "I couldn't get an answer from the team this time, try asking again in a bit." The request is kept. The next time Adam wakes Milo, a later row is read as "By the way, Brenda came back on your earlier question", and only then marked read. Asking "any answer yet?" still reads it too.
 

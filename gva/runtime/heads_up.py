@@ -316,18 +316,10 @@ class MeetingHeadsUp:
         sink = self.sink
         if sink is None:
             return
-        from gva.runtime.audio import tone
+        from gva.runtime.chime import play_chime
 
         self.last_chime = "soft"
-        rate = int(getattr(sink, "sample_rate", 0) or 24000)
-        pcm = tone(50, 523, amp=1800, sample_rate=rate) + tone(70, 784, amp=1800, sample_rate=rate)
-        try:
-            resume = getattr(sink, "resume", None)
-            if resume:
-                resume()
-            sink.write(pcm)
-        except Exception:
-            return
+        play_chime(sink, self.cfg)
 
     def _request_follow_up(self) -> None:
         self.follow_ups += 1

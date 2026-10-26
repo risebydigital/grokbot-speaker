@@ -27,6 +27,8 @@ audio:
   playback_prebuffer_ms: 200
   # PortAudio latency hint for the USB speaker. high or low.
   playback_latency: high
+  # Meeting heads-up and nudge chime. 1 is full (peak 18000). 0 is silent.
+  chime_volume: 1.0
 
 wake:
   engine: openwakeword
