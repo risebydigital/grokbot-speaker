@@ -1,5 +1,7 @@
 """The approved chime: length, rate, peak, and a click-free resample."""
 
+import hashlib
+
 import numpy as np
 from typer.testing import CliRunner
 
@@ -28,11 +30,15 @@ def _band(samples: np.ndarray, rate: int, freq: float, width: float = 6.0) -> fl
     return float(spec[mask].max())
 
 
+# Bytes from the approved generator: astype(int16) of the scaled float buffer.
+_APPROVED_SHA256 = "e6b9df26a0f1861af7712b580b86ef14ab33011d9a7f8b9c26d45289031f6ad4"
+
+
 def test_canonical_chime_length_rate_peak_and_no_clip():
     pcm = chime_pcm(CANONICAL_RATE, 1.0)
     audio = _samples(pcm)
     assert audio.dtype == np.int16
-    assert len(audio) == int(round(DURATION_S * CANONICAL_RATE))
+    assert len(audio) == int(DURATION_S * CANONICAL_RATE)
     assert len(audio) == 52920
     peak = int(np.max(np.abs(audio)))
     assert peak == PEAK
@@ -41,6 +47,7 @@ def test_canonical_chime_length_rate_peak_and_no_clip():
     assert int(np.min(audio)) >= -PEAK
     assert audio[0] == 0
     assert audio[-1] == 0
+    assert hashlib.sha256(pcm).hexdigest() == _APPROVED_SHA256
 
 
 def test_chime_is_g4_then_d5_landing_on_b4_and_g4():

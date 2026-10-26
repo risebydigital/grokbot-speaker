@@ -1,11 +1,15 @@
 """Milo's chime.
 
-Pure sines, a raised-cosine attack, a quiet second harmonic, and two short
-room reflections. The notes are G4, then D5, landing together on B4 and G4.
-The canonical buffer is 1.2 seconds, 44.1 kHz, mono 16-bit, peak 18000.
+This is the generator Adam approved on 26 Oct 2026. Written pitches D4, A4
+and F#4 are transposed up a fourth, so what plays is G4, then D5, landing on
+B4 and G4. Each note is a sine plus a quiet second harmonic, with a
+raised-cosine attack. Two short room reflections follow, then a linear fade
+over the last quarter second. 44.1 kHz mono 16-bit, 1.2 seconds, peak 18000.
 
-Playback resamples that whole buffer to the output device rate, with silence
-padded on either side so the filter does not click, then fades the edges.
+Playback resamples that whole buffer to the output device rate. Silence is
+padded on either side so the filter does not click, and a few milliseconds
+at each edge are faded. The note itself starts 20 ms in, so that fade stays
+inside the silence.
 """
 
 from __future__ import annotations
@@ -18,34 +22,36 @@ CANONICAL_RATE = 44100
 DURATION_S = 1.2
 PEAK = 18000
 
-# Equal temperament, A4 = 440 Hz.
-G4 = 440.0 * 2.0 ** (-2.0 / 12.0)
-B4 = 440.0 * 2.0 ** (2.0 / 12.0)
-D5 = 440.0 * 2.0 ** (5.0 / 12.0)
+# Written pitches, then up a fourth (2 ** (5/12)).
+_TRANSPOSE = 2.0 ** (5.0 / 12.0)
+_D4 = 293.7
+_FS4 = 370.0
+_A4 = 440.0
+G4 = _D4 * _TRANSPOSE
+D5 = _A4 * _TRANSPOSE
+B4 = _FS4 * _TRANSPOSE
 
-_ATTACK_S = 0.015
-_RELEASE_S = 0.045
-_HARMONIC = 0.035
-# Delay in seconds, linear gain. Short enough to read as a small room.
-_REFLECTIONS = ((0.0125, 0.14), (0.027, 0.06))
-_EDGE_FADE_S = 0.040
-# start, end, frequency, amplitude, decay time constant
-_NOTES = (
-    (0.00, 0.78, G4, 1.00, 0.26),
-    (0.28, 0.86, D5, 0.92, 0.20),
-    (0.58, DURATION_S, B4, 0.78, 0.34),
-    (0.58, DURATION_S, G4, 0.70, 0.36),
-)
+_ATTACK_S = 0.03
+_HARMONIC = 0.06
+_REFLECTIONS = ((0.03, 0.12), (0.06, 0.07))
+_TAIL_FADE_S = 0.25
+# Inside the 20 ms of silence before the first note, and inside the tail fade.
+_EDGE_FADE_S = 0.008
 
-_canonical: np.ndarray | None = None
+_approved: np.ndarray | None = None
+
+
+def _approved_float() -> np.ndarray:
+    """The approved buffer before the int16 cast. Peak is 18000."""
+    global _approved
+    if _approved is None:
+        _approved = _render()
+    return _approved
 
 
 def canonical_samples() -> np.ndarray:
-    """The 44.1 kHz int16 buffer. Cached, because every chime is the same."""
-    global _canonical
-    if _canonical is None:
-        _canonical = _synthesize()
-    return _canonical
+    """44.1 kHz int16. Same bytes as the approved generator's wave writer."""
+    return _approved_float().astype(np.int16)
 
 
 def canonical_pcm() -> bytes:
@@ -55,15 +61,12 @@ def canonical_pcm() -> bytes:
 def chime_pcm(sample_rate: int = CANONICAL_RATE, volume: float = 1.0) -> bytes:
     """Mono int16 at ``sample_rate``. ``volume`` 1 peaks at 18000. 0 is silence."""
     level = _volume(volume)
-    source = canonical_samples()
     rate = int(sample_rate)
     if rate == CANONICAL_RATE:
-        if level == 1.0:
-            return source.tobytes()
-        return _scale(source.astype(np.float64), int(round(PEAK * level)))
+        return (_approved_float() * level).astype(np.int16).tobytes()
     if rate <= 0:
         raise ValueError("sample rate must be positive")
-    audio = _resample(source.astype(np.float64), CANONICAL_RATE, rate)
+    audio = _resample(_approved_float(), CANONICAL_RATE, rate)
     audio = _fade_edges(audio, rate, _EDGE_FADE_S)
     return _scale(audio, int(round(PEAK * level)))
 
@@ -108,41 +111,31 @@ def _volume(value: float) -> float:
     return min(1.0, max(0.0, number))
 
 
-def _synthesize() -> np.ndarray:
-    count = int(round(DURATION_S * CANONICAL_RATE))
+def _render() -> np.ndarray:
+    """Direct port of the approved generator, including the int16-ready scale."""
+    count = int(DURATION_S * CANONICAL_RATE)
     t = np.arange(count, dtype=np.float64) / CANONICAL_RATE
-    dry = np.zeros(count, dtype=np.float64)
-    for start, end, freq, amp, decay in _NOTES:
-        dry += _strike(t, freq, start, end, amp, decay)
+    dry = _note(t, _D4, 0.02, 0.55, decay=0.16) + _note(t, _A4, 0.14, 0.6, decay=0.16)
+    dry = dry + _note(t, _FS4, 0.28, 0.7, decay=0.38) + _note(t, _D4, 0.28, 0.3, decay=0.38)
     wet = dry.copy()
     for delay_s, gain in _REFLECTIONS:
-        shift = int(round(delay_s * CANONICAL_RATE))
-        if 0 < shift < count:
-            wet[shift:] += gain * dry[:-shift]
-    wet = _fade_edges(wet, CANONICAL_RATE, _EDGE_FADE_S)
-    pcm = _scale(wet, PEAK)
-    return np.frombuffer(pcm, dtype=np.int16).copy()
+        shift = int(delay_s * CANONICAL_RATE)
+        wet[shift:] += gain * dry[:-shift]
+    fade = int(_TAIL_FADE_S * CANONICAL_RATE)
+    wet[-fade:] *= np.linspace(1.0, 0.0, fade)
+    peak = float(np.max(np.abs(wet)))
+    return wet / peak * PEAK
 
 
-def _strike(t: np.ndarray, freq: float, start: float, end: float, amp: float, decay: float) -> np.ndarray:
-    local = t - start
-    span = end - start
-    active = (local >= 0.0) & (local <= span)
+def _note(t: np.ndarray, freq: float, start: float, amp: float, decay: float) -> np.ndarray:
+    sounding = freq * _TRANSPOSE
     out = np.zeros_like(t)
-    if span <= 0.0 or not np.any(active):
-        return out
-    x = local[active]
-    attack = 0.5 * (1.0 - np.cos(np.pi * np.clip(x / _ATTACK_S, 0.0, 1.0)))
-    tail = np.exp(-x / decay)
-    release = np.ones_like(x)
-    release_from = span - _RELEASE_S
-    fading = x > release_from
-    if np.any(fading):
-        phase = np.clip((x[fading] - release_from) / _RELEASE_S, 0.0, 1.0)
-        release[fading] = 0.5 * (1.0 + np.cos(np.pi * phase))
-    envelope = amp * attack * tail * release
-    tone = np.sin(2.0 * np.pi * freq * t[active]) + _HARMONIC * np.sin(4.0 * np.pi * freq * t[active])
-    out[active] = tone * envelope
+    active = t >= start
+    local = t[active] - start
+    attack = 0.5 - 0.5 * np.cos(np.pi * np.minimum(local / _ATTACK_S, 1.0))
+    envelope = attack * np.exp(-np.maximum(local - _ATTACK_S, 0.0) / decay)
+    partials = np.sin(2.0 * np.pi * sounding * local) + _HARMONIC * np.sin(4.0 * np.pi * sounding * local)
+    out[active] = amp * envelope * partials
     return out
 
 
