@@ -21,6 +21,7 @@ import asyncio
 import base64
 import json
 import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -102,7 +103,9 @@ class RealtimeProtocol:
         self._response_active = False
         self._bridge_items: list[dict[str, Any]] = []
         self._bridge_inflight: dict[str, Any] | None = None
+        self._bridge_awaiting_audio: dict[str, Any] | None = None
         self._bridge_lock = __import__("threading").Lock()
+        self.on_bridge_spoken = None
         self.fallback_player = None
         self.session_id = new_ulid()
 
@@ -185,11 +188,13 @@ class RealtimeProtocol:
             self.speaking = False
             # response.create while a response is still active is rejected, and the
             # model then says nothing. Send it only after this response has finished.
+            heard_ms = _pcm_ms(self._response_pcm_bytes, self.cfg.conversation.realtime.sample_rate)
             owe_reply = self._need_response_create
             self._need_response_create = False
             if owe_reply:
                 self._defer_silence_fallback = True
             self._finish_turn(event, status="ok", intent=None)
+            self._settle_bridge_audio(heard_ms)
             if owe_reply:
                 message: dict[str, Any] = {"type": "response.create"}
                 instructions = self._response_instructions
@@ -302,11 +307,20 @@ class RealtimeProtocol:
         if name == "ask_rbd_team":
             if outcome.result.get("status") == "sent":
                 phrase = WAITING_LINE
+                items = self._waiting_items()
+                if items:
+                    outcome.result = dict(outcome.result)
+                    outcome.result["pending_items"] = items
+                    from gva.runtime.bridge import context_waiting_instructions
+
+                    self._response_instructions = context_waiting_instructions()
+                else:
+                    self._response_instructions = f"Say only: {phrase}"
             else:
                 phrase = UNREACHABLE_LINE
+                self._response_instructions = f"Say only: {phrase}"
             self._bridge_ack_pending = True
             self._bridge_ack_phrase = phrase
-            self._response_instructions = f"Say only: {phrase}"
         elif name == "check_team_answer":
             if outcome.result.get("status") == "ready":
                 phrase = str(outcome.result.get("answer") or "").strip() or NOT_YET_LINE
@@ -436,13 +450,46 @@ class RealtimeProtocol:
         """True while a response is open. A late answer waits, then speaks."""
         return bool(self._response_active or self._need_response_create)
 
-    def enqueue_bridge(self, messages: list[dict[str, Any]], text: str) -> None:
+    def playback_pending(self) -> bool:
+        """True until the current reply has finished coming out of the speaker."""
+        if self.bridge_blocked() or self.speaking:
+            return True
+        try:
+            if not self.playback.empty():
+                return True
+        except Exception:
+            return True
+        queued = getattr(self.sink, "queued_frames", None)
+        if callable(queued):
+            try:
+                if int(queued()) > 0:
+                    return True
+            except Exception:
+                return False
+        return False
+
+    def _waiting_items(self) -> list[dict[str, Any]]:
+        if not self.cfg.bot_bridge.chat_while_waiting:
+            return []
+        bridge = getattr(self.tools, "ctx", None)
+        bridge = getattr(bridge, "bridge", None)
+        if bridge is None or not hasattr(bridge, "waiting_context"):
+            return []
+        try:
+            items = bridge.waiting_context() or []
+        except Exception:
+            return []
+        return list(items)[:8]
+
+    def enqueue_bridge(self, messages: list[dict[str, Any]], text: str, request_id: str = "") -> None:
         with self._bridge_lock:
-            self._bridge_items.append({"messages": messages, "text": text, "sent": False})
+            self._bridge_items.append(
+                {"messages": messages, "text": text, "request_id": request_id, "sent": False, "confirmed": False}
+            )
 
     def pop_bridge_ready(self) -> dict[str, Any] | None:
         with self._bridge_lock:
-            if self._bridge_inflight is not None or self.bridge_blocked() or not self._bridge_items:
+            if self._bridge_inflight is not None or self.playback_pending() or not self._bridge_items:
                 return None
             self._bridge_inflight = self._bridge_items.pop(0)
             return self._bridge_inflight
@@ -456,20 +503,58 @@ class RealtimeProtocol:
             if ok:
                 item["sent"] = True
                 self._response_active = True
+                if item.get("request_id"):
+                    self._bridge_awaiting_audio = item
             else:
                 self._bridge_items.insert(0, item)
 
-    def drain_unsent(self) -> list[str]:
+    def drain_unsent(self) -> list[dict[str, str]]:
         with self._bridge_lock:
-            texts: list[str] = []
-            if self._bridge_inflight and not self._bridge_inflight.get("sent"):
-                texts.append(self._bridge_inflight["text"])
+            pending: list[dict[str, Any]] = []
+            if self._bridge_awaiting_audio and not self._bridge_awaiting_audio.get("confirmed"):
+                pending.append(self._bridge_awaiting_audio)
+                self._bridge_awaiting_audio = None
+            if self._bridge_inflight and not self._bridge_inflight.get("confirmed"):
+                pending.append(self._bridge_inflight)
                 self._bridge_inflight = None
             for item in self._bridge_items:
-                if not item.get("sent"):
-                    texts.append(item["text"])
+                if not item.get("confirmed"):
+                    pending.append(item)
             self._bridge_items.clear()
-            return texts
+            return [
+                {"request_id": str(item.get("request_id") or ""), "text": str(item.get("text") or "")}
+                for item in pending
+                if item.get("text")
+            ]
+
+    def _settle_bridge_audio(self, audio_ms: int) -> None:
+        """The readout either produced audio, or it has to be said another way."""
+        with self._bridge_lock:
+            item = self._bridge_awaiting_audio
+            if item is None:
+                return
+            self._bridge_awaiting_audio = None
+            if audio_ms > 0:
+                item["confirmed"] = True
+            else:
+                item["sent"] = False
+        hook = self.on_bridge_spoken
+        if hook is None:
+            if audio_ms <= 0:
+                with self._bridge_lock:
+                    self._bridge_items.insert(0, item)
+            return
+        try:
+            asyncio.get_running_loop()
+            in_loop = True
+        except RuntimeError:
+            in_loop = False
+        if in_loop:
+            threading.Thread(
+                target=hook, args=(item, audio_ms > 0), name="gva-bridge-speak", daemon=True
+            ).start()
+            return
+        hook(item, audio_ms > 0)
 
     def _speak_phrase(self, phrase: str) -> int:
         """Speak one short line. A test player wins. Otherwise try Piper."""
@@ -690,8 +775,11 @@ class RealtimeAssistant:
         self._bridge_leftover = []
         if self.bridge is None:
             return
-        for text in leftover:
-            self.bridge.speak_closed(text, chime=True)
+        for item in leftover:
+            if isinstance(item, str):
+                self.bridge.speak_unconfirmed("", item)
+            else:
+                self.bridge.speak_unconfirmed(item.get("request_id") or "", item.get("text") or "")
 
     def _wait_for_wake(self) -> bool:
         while not self.shutdown.is_set():
@@ -803,7 +891,7 @@ class RealtimeAssistant:
                 raise
             except Exception:
                 protocol.finish_bridge_send(False)
-                return
+                await asyncio.sleep(0.2)
 
     async def _play_queued(self, protocol: RealtimeProtocol, aec) -> None:
         """Drain the playback queue on its own task so a slow device cannot stall the socket."""
@@ -842,7 +930,7 @@ class RealtimeAssistant:
         voice = self.cfg.conversation.realtime
         while not protocol.close and not self.shutdown.is_set():
             # Idle follows server conversation events. A live microphone must not refresh it.
-            if protocol.idle(time.monotonic(), voice.silence_timeout_s):
+            if idle_should_close(protocol, self.bridge, time.monotonic(), voice.silence_timeout_s):
                 protocol.close = True
                 await _close_socket(ws)
                 return
@@ -908,6 +996,13 @@ class RealtimeAssistant:
             queue_depths={"capture": 0},
             api_reachable=True,
         )
+
+
+def idle_should_close(protocol, bridge, now: float, silence_s: float) -> bool:
+    """Silence ends a call, except while a team answer is still on its way."""
+    if bridge is not None and bridge.holds_session():
+        return False
+    return protocol.idle(now, silence_s)
 
 
 async def _close_socket(ws) -> None:

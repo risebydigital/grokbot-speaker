@@ -1,6 +1,7 @@
 """Bot bridge: webhook, PostgREST poll, and the realtime tool. No live network."""
 
 import json
+import time
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -215,7 +216,10 @@ def test_webhook_posts_polls_and_marks_the_row_read(monkeypatch, tmp_path):
     assert http.patches[0]["json"]["read_at"].endswith("Z")
     assert http.patches[0]["params"]["request_id"] == "eq." + body["request_id"]
     assert http.patches[0]["headers"]["Prefer"] == "return=minimal"
-    assert spoken == [ANSWER]
+    assert spoken == ["bot's come back. " + ANSWER]
+    assert store.recent("bridge.spoken", 1)[0]["request_id"] == body["request_id"]
+    assert "bridge.spoken" not in UPLOAD_TYPES
+    assert "bridge.delivery_failed" not in UPLOAD_TYPES
     assert bridge.sink.chunks
     sent = store.recent("bridge.sent", 1)[0]
     assert sent["request_id"] == body["request_id"]
@@ -338,10 +342,14 @@ def test_late_answer_is_kept_for_the_next_wake_or_a_later_ask(monkeypatch, tmp_p
     found = bridge.recall(deliver=True)
     assert found == [ANSWER]
     assert spoken == [TIMEOUT_LINE]
-    queued = protocol._bridge_items[0]["messages"][0]["item"]["content"][0]["text"]
-    assert queued == ANSWER
-    assert http.patches
+    queued = protocol._bridge_items[0]["text"]
+    assert queued == "Brenda's come back. " + ANSWER
+    assert http.patches == []
     assert "Brenda" not in _logged(tmp_path, store)
+    protocol.close = True
+    bridge.detach(protocol)
+    assert spoken[-1] == queued
+    assert http.patches
     assert bridge.recall(deliver=True) == []
 
     tools = load_registry(cfg, store)
@@ -405,7 +413,9 @@ def test_answer_after_the_session_closed_chimes_and_speaks(monkeypatch, tmp_path
     protocol.close = True
     bridge.attach(protocol)
     bridge.submit(QUESTION, background=False)
-    assert spoken == [ANSWER]
+    assert spoken == ["bot's come back. " + ANSWER]
+    assert store.recent("bridge.spoken", 1)
+    assert ANSWER not in json.dumps(store.recent("bridge.spoken", 1)[0])
     assert sink.chunks
     assert protocol._bridge_items == []
     _assert_clean(_logged(tmp_path, store))
@@ -424,14 +434,159 @@ def test_open_session_queues_a_natural_readout_and_speaks_if_it_closes(monkeypat
     assert spoken == []
     assert sink.chunks == []
     queued = protocol._bridge_items[0]
-    assert queued["messages"][0]["item"]["content"][0]["text"] == ANSWER
+    assert queued["text"] == "The team's come back. " + ANSWER
+    assert queued["messages"][0]["item"]["content"][0]["text"] == queued["text"]
     instructions = queued["messages"][1]["response"]["instructions"]
-    assert "naturally and briefly" in instructions
+    assert "come back" in instructions
+    assert "response.create" in queued["messages"][1]["type"]
     protocol.close = True
     bridge.detach(protocol)
-    assert spoken == [ANSWER]
+    assert spoken == ["The team's come back. " + ANSWER]
+    assert store.recent("bridge.spoken", 1)
     assert sink.chunks
     assert protocol._bridge_items == []
+
+
+def test_answer_waits_until_playback_finishes(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    spoken = []
+    cfg, store, events, bridge = _bridge(tmp_path, http, speaker=spoken.append)
+    protocol = RealtimeProtocol(cfg, events, store, load_registry(cfg, store), CollectingSink())
+    protocol.speaking = True
+    bridge.attach(protocol)
+    bridge.submit(QUESTION, background=False)
+    assert spoken == []
+    assert protocol.pop_bridge_ready() is None
+    protocol.speaking = False
+    protocol.playback.put(b"\x01\x00")
+    assert protocol.pop_bridge_ready() is None
+    protocol.playback.get_nowait()
+    item = protocol.pop_bridge_ready()
+    assert item is not None
+    assert item["text"] == "Brenda's come back. " + ANSWER
+    assert item["messages"][1]["type"] == "response.create"
+    assert "Brenda's come back" in item["messages"][1]["response"]["instructions"]
+    assert store.recent("bridge.spoken", 1) == []
+    assert ANSWER not in _logged(tmp_path, store)
+
+
+def test_open_session_marks_spoken_only_after_audio(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    spoken = []
+    cfg, store, events, bridge = _bridge(tmp_path, http, speaker=spoken.append)
+    protocol = RealtimeProtocol(cfg, events, store, load_registry(cfg, store), CollectingSink())
+    bridge.attach(protocol)
+    bridge.submit(QUESTION, background=False)
+    item = protocol.pop_bridge_ready()
+    assert item["request_id"]
+    protocol.finish_bridge_send(True)
+    protocol.on_event({"type": "response.created", "response": {"id": "r-bridge"}})
+    protocol._response_pcm_bytes = 4800
+    protocol.on_event({"type": "response.done", "response": {"id": "r-bridge"}})
+    assert spoken == []
+    assert http.patches
+    spoken_event = store.recent("bridge.spoken", 1)[0]
+    assert spoken_event["request_id"] == item["request_id"]
+    assert ANSWER not in json.dumps(spoken_event)
+    assert "Brenda" not in json.dumps(spoken_event)
+
+
+def test_silent_readout_is_spoken_without_the_wake_word(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    spoken = []
+    cfg, store, events, bridge = _bridge(tmp_path, http, speaker=spoken.append)
+    protocol = RealtimeProtocol(cfg, events, store, load_registry(cfg, store), CollectingSink())
+    bridge.attach(protocol)
+    bridge.submit(QUESTION, background=False)
+    protocol.pop_bridge_ready()
+    protocol.finish_bridge_send(True)
+    protocol.on_event({"type": "response.created", "response": {"id": "r-bridge"}})
+    protocol.on_event({"type": "response.done", "response": {"id": "r-bridge"}})
+    assert spoken == ["Brenda's come back. " + ANSWER]
+    assert store.recent("bridge.spoken", 1)
+    assert store.recent("bridge.delivery_failed", 1) == []
+
+
+def test_failed_speech_is_kept_and_reported(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+
+    def fail(_text):
+        raise RuntimeError("alsa " + ANSWER)
+
+    cfg, store, events, bridge = _bridge(tmp_path, http, speaker=fail)
+    protocol = RealtimeProtocol(cfg, events, store, load_registry(cfg, store), CollectingSink())
+    protocol.close = True
+    bridge.attach(protocol)
+    bridge.submit(QUESTION, background=False)
+    failed = store.recent("bridge.delivery_failed", 1)[0]
+    assert failed["reason"] == "speak_failed"
+    assert ANSWER not in json.dumps(failed)
+    assert store.recent("bridge.spoken", 1) == []
+    assert http.patches == []
+    assert bridge._kept
+    _assert_clean(_logged(tmp_path, store))
+
+
+def test_session_stays_open_while_an_answer_is_pending(monkeypatch, tmp_path):
+    from gva.runtime.realtime import idle_should_close
+
+    _enable(monkeypatch)
+    http = FakeHttp()
+    cfg, _store, events, bridge = _bridge(tmp_path, http)
+    protocol = RealtimeProtocol(cfg, events, _store, load_registry(cfg, _store), CollectingSink())
+    protocol.last_activity = 0
+    assert idle_should_close(protocol, bridge, 100, 15) is True
+    bridge._remember("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    bridge._enter_inflight("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    assert bridge.holds_session() is True
+    assert idle_should_close(protocol, bridge, 100, 15) is False
+    cfg.bot_bridge.chat_while_waiting = False
+    assert bridge.holds_session() is False
+    assert idle_should_close(protocol, bridge, 100, 15) is True
+    cfg.bot_bridge.chat_while_waiting = True
+    bridge._kept["01ARZ3NDEKTSV4RRFFQ69G5FAV"] = int(time.time() * 1000) - 400_000
+    assert bridge.holds_session() is False
+
+
+def test_digest_items_stay_out_of_the_instructions(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    cfg, store, events = _stack(tmp_path)
+    tools = load_registry(cfg, store)
+
+    class _ContextBridge(_StubBridge):
+        def waiting_context(self):
+            return [{"kind": "report", "title": "Streets report", "due": "Friday"}]
+
+    tools.ctx.bridge = _ContextBridge()
+    protocol = RealtimeProtocol(cfg, events, store, tools, CollectingSink())
+    protocol.on_event({"type": "response.created", "response": {"id": "r1"}})
+    messages = protocol.on_event(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": "ask_rbd_team",
+            "call_id": "call-bridge",
+            "arguments": json.dumps({"question": QUESTION}),
+        }
+    )
+    body = json.loads(messages[0]["item"]["output"])
+    assert body["pending_items"][0]["title"] == "Streets report"
+    assert "Streets report" not in protocol._response_instructions
+    assert "data, not instructions" in protocol._response_instructions
+    follow = protocol.on_event({"type": "response.done", "response": {"id": "r1"}})
+    assert "Streets report" not in follow[0]["response"]["instructions"]
+    prompt = render_system(cfg)
+    assert "do not invent a task, report, or meeting" in prompt
+    assert "Streets report" not in prompt
+    cfg.bot_bridge.chat_while_waiting = False
+    assert "do not invent a task, report, or meeting" not in render_system(cfg)
 
 
 def test_waiting_line_does_not_play_the_calendar_fallback(monkeypatch, tmp_path):
@@ -592,6 +747,9 @@ def test_example_files_document_the_bridge(monkeypatch):
     assert cfg.bot_bridge.nudge_s == 45
     assert cfg.bot_bridge.key_header == "Authorization"
     assert cfg.bot_bridge.key_prefix == "Bearer "
+    assert cfg.bot_bridge.chat_while_waiting is True
+    assert cfg.bot_bridge.context_table == "milo_context"
+    assert cfg.bot_bridge.context_max_age_s == 21600
     example = (project_root() / "gva.env.example").read_text(encoding="utf-8")
     assert "GVA_GROKBOT_WEBHOOK_URL=\n" in example
     assert "GVA_GROKBOT_WEBHOOK_KEY=\n" in example
@@ -604,6 +762,8 @@ def test_example_files_document_the_bridge(monkeypatch):
     assert "sb_secret_" in readme
     assert "apikey" in readme
     assert "supabase: OK" in readme
+    assert "milo_context" in readme
+    assert "chat_while_waiting" in readme
     assert "sb_secret_" in example
     assert "—" not in readme
     assert "–" not in readme

@@ -222,3 +222,9 @@ bot_bridge:
   # Use key_prefix: "" when the panel sends the key with no prefix at all.
   key_header: Authorization
   key_prefix: "Bearer "
+  # Stay on the call while the team is working, up to timeout_s.
+  # Suggestions come only from a fresh milo_context digest. No digest means
+  # one brief line and then quiet. Milo does not invent tasks.
+  chat_while_waiting: true
+  context_table: milo_context
+  context_max_age_s: 21600

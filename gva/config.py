@@ -257,6 +257,12 @@ class BotBridgeConfig(BaseModel):
     key_header: str = "Authorization"
     # "Bearer " includes the trailing space. An empty string sends the key with no prefix.
     key_prefix: str = "Bearer "
+    # Keep the realtime session up while an answer is pending, and allow one
+    # short line about real items from the digest. No invented suggestions.
+    chat_while_waiting: bool = True
+    context_table: str = "milo_context"
+    # Ignore a digest older than this. Six hours.
+    context_max_age_s: int = Field(default=21600, ge=60, le=604800)
 
 
 class Config(BaseModel):

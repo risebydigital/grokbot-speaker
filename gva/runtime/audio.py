@@ -276,9 +276,13 @@ class JitterBuffer:
                 out[:take] = self._samples[:take]
                 self._samples = self._samples[take:]
             if take < frames and self._fed:
-                self.underruns += 1
+                # A short final block is the tail of the reply. Counting that and
+                # the idle callback after it reported two underruns on every turn.
+                # Only a callback that receives nothing, while audio was still
+                # expected, is a gap.
                 if take == 0:
-                    self._fed = False
+                    self.underruns += 1
+                self._fed = False
         return out
 
     def clear(self) -> None:
@@ -507,6 +511,10 @@ class SoundDeviceSink:
         count = int(self.buffer.underruns)
         self.buffer.underruns = 0
         return count
+
+    def queued_frames(self) -> int:
+        """Frames still waiting in the jitter buffer. Playback is not finished while this is above zero."""
+        return int(self.buffer.buffered())
 
     def stop(self) -> None:
         """Drop queued speech. The stream stays open; the next write does not reopen it."""

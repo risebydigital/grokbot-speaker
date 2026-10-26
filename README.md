@@ -127,6 +127,9 @@ Non-secret settings live in `/etc/gva/config.yaml`, seeded from [`config/config.
 | `bot_bridge.nudge_s` | `45` | One "still checking" line. `0` turns it off |
 | `bot_bridge.key_header` | `Authorization` | Header name copied from the Grok Bot routine panel |
 | `bot_bridge.key_prefix` | `Bearer ` | Prefix copied from that panel. `""` sends no prefix |
+| `bot_bridge.chat_while_waiting` | `true` | Keep the call open while an answer is pending |
+| `bot_bridge.context_table` | `milo_context` | Digest table. Missing table means no suggestions |
+| `bot_bridge.context_max_age_s` | `21600` | Ignore a digest older than this (six hours) |
 
 Change an allow-listed key with `gva config set <key> <value>`. Secrets are rejected there. They belong only in the env file.
 
@@ -157,9 +160,13 @@ Set `key_prefix: ""` to send the key with no prefix. The post times out after 10
 
 Each post body is `{"request_id", "device_id", "question", "asked_at", "reply_by"}`.
 
-Milo says it is checking with the team, then polls `public.milo_bot_answers` until the answer arrives or `bot_bridge.timeout_s` runs out (five minutes by default, because a routine can start a few minutes late). About 45 seconds in, Milo says once: "Still checking with the team." Polling continues after the voice session has closed and Milo is back on the wake word. When a row arrives in time, Milo reads it out. If the session is still open, it is spoken there. If the session has closed, Milo plays a short chime, then reads the text on a short realtime session (verbatim), or with Piper if that session cannot start. The row's `read_at` is filled in afterwards. If nothing arrives in time, Milo says: "Sorry, the team didn't get back to me in time. I'll have it next time you ask." The request is kept. A later row is still read out on the next wake, or when you ask "any answer yet?".
+Milo says it is checking with the team, then polls `public.milo_bot_answers` until the answer arrives or `bot_bridge.timeout_s` runs out (five minutes by default, because a routine can start a few minutes late). With `bot_bridge.chat_while_waiting` (the default) the realtime session stays open while that answer is pending, up to the same timeout, so silence does not hang up. About 45 seconds in, Milo says once: "Still checking with the team."
 
-`bridge.sent`, `bridge.answered` (with `latency_ms`), `bridge.timeout`, and `bridge.error` go to the local event log and the on-device database. They are not uploaded with the voice-ops sync, and they do not contain the question or the answer.
+Suggestions during the wait come only from `public.milo_context`, a digest Brenda posts. Milo may mention one or two of those items in a single short line, for example that a named report is due, and then listens. The items are passed to the model as data, not as instructions. If the digest is missing, empty, older than `context_max_age_s`, or the table is not there yet (HTTP 404), Milo does not invent anything: one brief friendly line, then quiet. There is no migration for `milo_context` in this repository.
+
+When a row arrives, Milo waits until the current reply has finished playing, then says "Brenda's come back" (or the answering bot's name) and reads it. If the session is still open, that is a conversation item plus `response.create`. If the session has closed, or the model produces no audio, Milo plays a short chime and says it on a short realtime session, or with Piper, without waiting for the wake word. `read_at` is set only after that speech. If the speech fails, the request is kept and `bridge.delivery_failed` records a short reason. If nothing arrives in time, Milo says: "Sorry, the team didn't get back to me in time. I'll have it next time you ask." A later row is still read out on the next wake, or when you ask "any answer yet?".
+
+`bridge.sent`, `bridge.answered` (with `latency_ms`), `bridge.spoken`, `bridge.delivery_failed`, `bridge.timeout`, and `bridge.error` go to the local event log and the on-device database. They are not uploaded with the voice-ops sync, and they do not contain the question, the answer, or the digest.
 
 ### One-off setup
 

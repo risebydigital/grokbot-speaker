@@ -13,7 +13,8 @@
       "tool.rejected", "tts.completed", "playback.completed", "turn.completed", "error",
       "config.changed", "budget.threshold", "budget.degraded", "eval.case", "eval.summary",
       "sync.completed", "audio.device_lost",
-      "bridge.sent", "bridge.answered", "bridge.timeout", "bridge.error"
+      "bridge.sent", "bridge.answered", "bridge.timeout", "bridge.error",
+      "bridge.spoken", "bridge.delivery_failed"
     ]},
     "ts": {"type": "string", "format": "date-time"},
     "mono_ms": {"type": "integer", "minimum": 0},
@@ -40,7 +41,9 @@
     {"if": {"properties": {"type": {"const": "stt.completed"}}, "required": ["type"]},
      "then": {"$ref": "#/$defs/stt_completed"}},
     {"if": {"properties": {"type": {"const": "bridge.answered"}}, "required": ["type"]},
-     "then": {"required": ["latency_ms"], "properties": {"latency_ms": {"type": "integer", "minimum": 0}}}}
+     "then": {"required": ["latency_ms"], "properties": {"latency_ms": {"type": "integer", "minimum": 0}}}},
+    {"if": {"properties": {"type": {"const": "bridge.delivery_failed"}}, "required": ["type"]},
+     "then": {"required": ["reason"], "properties": {"reason": {"type": "string", "minLength": 1, "maxLength": 80}}}}
   ],
   "$defs": {
     "usage": {
