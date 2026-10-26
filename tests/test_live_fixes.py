@@ -180,6 +180,10 @@ def test_playback_and_stt_report_real_durations(tmp_path):
     protocol.on_event({"type": "response.created", "response": {"id": "r"}})
     protocol.on_event({"type": "response.output_audio.delta", "delta": _b64(pcm)})
     protocol.on_event({"type": "response.done", "response": {"id": "r"}})
+    # Queued is not played. The event waits until the buffer has actually drained.
+    assert store.recent("playback.completed", 1) == []
+    protocol.playback.get_nowait()
+    protocol.note_output_idle()
     playback = store.recent("playback.completed", 1)[0]
     assert playback["audio_ms"] == 100
     assert playback["underruns"] == 0

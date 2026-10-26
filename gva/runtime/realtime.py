@@ -50,8 +50,12 @@ from gva.telemetry.store import Store
 BRIDGE_QUIET_S = 0.6
 # Exit if the microphone or the wake loop makes no progress for this long.
 # systemd Restart=always then brings the process back. Independent of the
-# socket watchdog, which only closes one call.
+# socket watchdog, which only closes one call. A speaker that is still
+# draining does not count as a stall: the play head is its own clock.
 LOOP_STALL_S = 30.0
+# After the DAC has played the last sample, keep the mic off the server for
+# this long. The speaker sits next to the mic and there is no echo canceller.
+HALF_DUPLEX_TAIL_S = 0.4
 _TRUNCATE_EVENTS = {
     "conversation.item.truncated",
     "conversation.item.truncate",
@@ -139,6 +143,13 @@ class RealtimeProtocol:
         self.mic_enabled = True
         self.listen_until = 0.0
         self.play_epoch = 0
+        self._half_duplex_tail = HALF_DUPLEX_TAIL_S
+        self._pending_playback: dict[str, Any] | None = None
+        self._ear_open_at = 0.0
+        self._heard_playback = False
+        self._barge_listen = False
+        self._input_needs_clear = False
+        self._input_cleared_for_hot = False
         # True only while _play_queued is the thread writing the speaker.
         self.player_live = False
         self._bridge_items: list[dict[str, Any]] = []
@@ -189,6 +200,102 @@ class RealtimeProtocol:
             self._stt_started = time.monotonic()
         self._stt_bytes += len(pcm)
         return {"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode("ascii")}
+
+    def speaker_drained(self, now: float | None = None) -> bool:
+        """True when nothing is queued and the output device has played it.
+
+        The software ring going empty is not enough: the ALSA buffer still has
+        the last latency worth of samples.
+        """
+        now = time.monotonic() if now is None else float(now)
+        if self._output_queued():
+            return False
+        return now >= self._hardware_audible_until()
+
+    def _hardware_audible_until(self) -> float:
+        fn = getattr(self.sink, "audible_until", None)
+        if not callable(fn):
+            return 0.0
+        try:
+            return float(fn())
+        except Exception:
+            return time.monotonic() + 3600.0
+
+    def half_duplex_hot(self, now: float | None = None) -> bool:
+        """True while the server must not hear the microphone.
+
+        Hot during playback, including the hardware drain, and for a short tail
+        afterwards. A local wake-word barge-in clears it so the next words are sent.
+        """
+        now = time.monotonic() if now is None else float(now)
+        if self._barge_listen:
+            return False
+        sounding = (self._response_active and self._armed_playback) or not self.speaker_drained(now)
+        if sounding:
+            self._ear_open_at = 0.0
+            self._heard_playback = True
+            return True
+        if not self._heard_playback:
+            return False
+        if self._ear_open_at <= 0.0:
+            self._ear_open_at = now
+        return (now - self._ear_open_at) < float(self._half_duplex_tail)
+
+    def mic_messages(self, pcm: bytes) -> list[dict[str, str]]:
+        """Socket messages for one microphone frame.
+
+        While the speaker is hot the frame is dropped. The server input buffer
+        is cleared once as we go quiet, and again when listening resumes, so a
+        tail of our own voice is not transcribed into the next turn.
+        """
+        now = time.monotonic()
+        if self.half_duplex_hot(now):
+            self.mic_enabled = False
+            if not self._input_cleared_for_hot:
+                self._input_cleared_for_hot = True
+                self._input_needs_clear = True
+                return [{"type": "input_audio_buffer.clear"}]
+            return []
+        self.mic_enabled = True
+        messages: list[dict[str, str]] = []
+        if self._input_needs_clear or self._input_cleared_for_hot:
+            self._input_needs_clear = False
+            self._input_cleared_for_hot = False
+            messages.append({"type": "input_audio_buffer.clear"})
+        if len(pcm) >= 2:
+            message = self.audio_message(pcm)
+            if message:
+                messages.append(message)
+        return messages
+
+    def _queue_playback_completed(self, audio_ms: int, interrupted: bool) -> None:
+        pending = self._pending_playback
+        if pending is None:
+            self._pending_playback = {"audio_ms": int(audio_ms), "interrupted": bool(interrupted)}
+            return
+        pending["audio_ms"] = int(pending["audio_ms"]) + int(audio_ms)
+        pending["interrupted"] = bool(pending["interrupted"] or interrupted)
+
+    def _complete_playback(self, now: float | None = None, *, force: bool = False) -> None:
+        """Emit playback.completed once the device has actually drained."""
+        pending = self._pending_playback
+        if pending is None or self.events is None:
+            return
+        if not force:
+            if self._response_active or self._need_response_create:
+                return
+            if not self.speaker_drained(time.monotonic() if now is None else float(now)):
+                return
+        self._pending_playback = None
+        try:
+            self.events.emit(
+                "playback.completed",
+                audio_ms=int(pending["audio_ms"]),
+                underruns=self._take_underruns(),
+                interrupted=bool(pending["interrupted"]),
+            )
+        except Exception:
+            return
 
     def on_event(self, event: dict[str, Any]) -> list[dict[str, Any]]:
         etype = event.get("type") or ""
@@ -304,6 +411,7 @@ class RealtimeProtocol:
             self._finish_turn(event, status="ok", intent=None)
             self._settle_bridge_audio(0 if cancelled else heard_ms)
             self._end_response()
+            self._complete_playback()
             if owe_reply:
                 self._need_response_create = True
                 message = self.pop_owed_reply()
@@ -356,6 +464,10 @@ class RealtimeProtocol:
         self._response_pcm_bytes += len(pcm) - (len(pcm) % 2)
         self.speaking = True
         self._armed_playback = True
+        self._heard_playback = True
+        self._barge_listen = False
+        self._ear_open_at = 0.0
+        self._input_cleared_for_hot = False
         self._was_busy = True
         self._line_idle_since = None
         self.listen_until = 0.0
@@ -377,15 +489,26 @@ class RealtimeProtocol:
                 return
             dropped += 1
 
-    def note_output_idle(self) -> None:
-        """Start the follow-up window once the speaker, not the queue, is quiet."""
+    def note_output_idle(self, now: float | None = None) -> None:
+        """Start the follow-up window once the speaker, not the queue, has drained.
+
+        ``now`` is the monotonic clock. Tests pass a later value to step over
+        the half-duplex tail without sleeping.
+        """
+        now = time.monotonic() if now is None else float(now)
+        drained = self.speaker_drained(now)
         # A model response stays "speaking" until response.done so a bridge
         # reply cannot start in a gap between audio deltas. A chime or a local
         # clip has no open response; clear it once the device has drained.
-        if not self._response_active and not self._cancel_pending and not self._need_response_create:
+        if drained and not self._response_active and not self._cancel_pending and not self._need_response_create:
             if not self._output_queued():
                 self.speaking = False
         self.note_drained()
+        self._complete_playback(now)
+        # The 8s window opens only after the DAC is quiet and the short tail
+        # that keeps the mic off the server has elapsed.
+        if not drained or self.half_duplex_hot(now):
+            return
         if self._response_active or self._cancel_pending or self._need_response_create:
             return
         if self.speaking or self._output_queued():
@@ -393,6 +516,8 @@ class RealtimeProtocol:
         if not self._armed_playback:
             return
         self._armed_playback = False
+        self._heard_playback = False
+        self._ear_open_at = 0.0
         self.mic_enabled = True
         resume = getattr(self.sink, "resume", None)
         if callable(resume):
@@ -400,13 +525,17 @@ class RealtimeProtocol:
                 resume()
             except Exception:
                 pass
-        now = time.monotonic()
         hold = float(getattr(self.cfg.conversation.realtime, "listen_after_playback_s", 8) or 8)
         self.listen_until = now + hold
 
     def cancel_playback(self) -> dict[str, str]:
         """Drop the current reply. A bridge answer that has not been confirmed stays queued."""
         self.speaking = False
+        self._barge_listen = True
+        self._heard_playback = False
+        self._ear_open_at = 0.0
+        self._input_needs_clear = True
+        self._input_cleared_for_hot = False
         self.drain_playback()
         self.sink.stop()
         resume = getattr(self.sink, "resume", None)
@@ -611,12 +740,10 @@ class RealtimeProtocol:
         if reply_hash:
             fields["response_hash"] = reply_hash
         self.events.emit("turn.completed", level="info" if status == "ok" else "warning", **fields)
-        self.events.emit(
-            "playback.completed",
-            audio_ms=audio_ms,
-            underruns=self._take_underruns(),
-            interrupted=status == "cancelled",
-        )
+        # Logged when the device has drained, not when the bytes were queued.
+        self._queue_playback_completed(audio_ms, status == "cancelled")
+        if status == "cancelled":
+            self._complete_playback(force=True)
         self._response_pcm_bytes = 0
         self._user_text = ""
         self._assistant = []
@@ -632,7 +759,9 @@ class RealtimeProtocol:
         """True until the current reply has finished coming out of the speaker."""
         if self._user_speaking or self.bridge_blocked() or self.speaking:
             return True
-        return self._output_queued()
+        if self._output_queued():
+            return True
+        return not self.speaker_drained(time.monotonic())
 
     def _output_queued(self) -> bool:
         try:
@@ -1208,6 +1337,11 @@ class RealtimeAssistant:
             return
         now = time.monotonic()
         limit = float(self._stall_s)
+        # A long reply blocks the session loop inside resample/write, and the
+        # session clock stops. The play head keeps moving on the callback
+        # thread. That is progress, not a stall, and must not exit the process.
+        if self._playback_progressing(now, limit):
+            return
         reasons: list[str] = []
         if self._capture_stalled(now, limit):
             reasons.append("audio")
@@ -1222,8 +1356,16 @@ class RealtimeAssistant:
             if reason not in unique:
                 unique.append(reason)
         what = " and ".join(unique)
+        detail = (
+            f"{what} loop stalled for {int(limit)}s "
+            f"(session {self._clock_age(self._session_at, now)}, "
+            f"wake {self._clock_age(self._wake_at, now)}, "
+            f"capture {self._capture_age(now)}, "
+            f"playback {self._playback_age(now)}, "
+            f"in_session={int(bool(self._in_session))})"
+        )
         self._log_failure(
-            RuntimeError(f"{what} loop stalled for {int(limit)}s"),
+            RuntimeError(detail),
             "audio.stalled" if "audio" in unique else "internal.stalled",
             "watchdog",
             "audio" if "audio" in unique else "internal",
@@ -1244,6 +1386,43 @@ class RealtimeAssistant:
         if last is None:
             return False
         return (now - float(last)) > limit
+
+    def _playback_progressing(self, now: float, limit: float) -> bool:
+        """True while the speaker has accepted or played audio inside the stall window."""
+        sink = self.sink
+        if sink is None:
+            return False
+        if getattr(sink, "writing", False):
+            started = float(getattr(sink, "write_started_at", 0) or 0)
+            if started and (now - started) <= limit:
+                return True
+        last = getattr(sink, "last_output_at", None)
+        if last:
+            return (now - float(last)) <= limit
+        return False
+
+    def _clock_age(self, stamp: float, now: float) -> str:
+        return f"{max(0, int(now - float(stamp)))}s"
+
+    def _capture_age(self, now: float) -> str:
+        capture = self.capture
+        if not getattr(capture, "running", False):
+            return "off"
+        last = getattr(capture, "last_audio_at", None)
+        if not last:
+            return "n/a"
+        return self._clock_age(float(last), now)
+
+    def _playback_age(self, now: float) -> str:
+        sink = self.sink
+        if sink is None:
+            return "n/a"
+        if getattr(sink, "writing", False):
+            return "writing"
+        last = getattr(sink, "last_output_at", None)
+        if not last:
+            return "n/a"
+        return self._clock_age(float(last), now)
 
     def _log_failure(self, exc: BaseException, code: str, stage: str, category: str) -> None:
         events = self.events
@@ -1455,7 +1634,10 @@ class RealtimeAssistant:
                     resume()
                 except Exception:
                     pass
-            protocol.sink.write(pcm)
+            # Off the event loop. A long resample must not freeze the session
+            # clock or the socket reader for the whole clip.
+            await asyncio.to_thread(protocol.sink.write, pcm)
+            self._session_at = time.monotonic()
             if aec is not None:
                 reference = resampler.process(pcm)
                 with self._aec_lock:
@@ -1472,10 +1654,28 @@ class RealtimeAssistant:
             return
         if count <= 0:
             return
+        # The first empty callback after a reply ends counts one underrun.
+        # That is the device going idle, about when the ring drains, and it
+        # is not a gap in the sentence. A gap while more audio is expected
+        # still has speaking set, a response open, or frames queued.
+        if self._trailing_underrun(protocol):
+            return
         try:
             self.events.emit("playback.underrun", level="warning", count=count, underruns=count)
         except Exception:
             return
+
+    def _trailing_underrun(self, protocol: RealtimeProtocol) -> bool:
+        if protocol._response_active or protocol._need_response_create:
+            return False
+        if protocol.speaking:
+            return False
+        try:
+            if protocol._output_queued():
+                return False
+        except Exception:
+            return False
+        return True
 
     async def _watchdog(self, ws, protocol: RealtimeProtocol) -> None:
         limit = self.cfg.conversation.realtime.watchdog_s
@@ -1502,8 +1702,8 @@ class RealtimeAssistant:
         while not protocol.close and not self.shutdown.is_set():
             self._session_at = time.monotonic()
             # Idle follows server conversation events and the end of playback.
-            # A live microphone must not refresh it. The mic stays unmuted.
-            protocol.mic_enabled = True
+            # A live microphone must not refresh it. The server does not hear
+            # the mic while the speaker is still playing.
             silence_s = self._session_silence_s if self._session_silence_s is not None else voice.silence_timeout_s
             if idle_should_close(protocol, self.bridge, time.monotonic(), silence_s):
                 protocol.close = True
@@ -1515,6 +1715,8 @@ class RealtimeAssistant:
                 await _close_socket(ws)
                 return
             if not frame:
+                for message in protocol.mic_messages(b""):
+                    await ws.send(json.dumps(message))
                 continue
             if protocol.speaking and self.cfg.conversation.barge_in != "off":
                 score = await asyncio.to_thread(self._barge_score, frame, aec)
@@ -1529,8 +1731,7 @@ class RealtimeAssistant:
                     reset = getattr(self.wake, "reset", None)
                     if reset:
                         reset()
-            message = protocol.audio_message(frame)
-            if message:
+            for message in protocol.mic_messages(frame):
                 await ws.send(json.dumps(message))
 
     def _after_session(self, _elapsed: float) -> None:
@@ -1582,6 +1783,13 @@ def idle_should_close(protocol, bridge, now: float, silence_s: float) -> bool:
     if callable(pending):
         try:
             if pending():
+                return False
+        except Exception:
+            return False
+    hot = getattr(protocol, "half_duplex_hot", None)
+    if callable(hot):
+        try:
+            if hot(now):
                 return False
         except Exception:
             return False

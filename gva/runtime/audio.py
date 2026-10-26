@@ -295,14 +295,18 @@ class JitterBuffer:
         self.pull_into(out)
         return out
 
-    def pull_into(self, out: np.ndarray) -> None:
-        """Copy the next frames into `out`. No new sample storage."""
+    def pull_into(self, out: np.ndarray) -> int:
+        """Copy the next frames into `out`. No new sample storage.
+
+        Returns how many frames came from the ring. Zero is silence: either the
+        pre-buffer has not filled, or this callback found the ring empty.
+        """
         frames = int(out.shape[0])
         with self._lock:
             if not self._primed:
                 if self._size < self.prebuffer_frames:
                     out.fill(0)
-                    return
+                    return 0
                 self._primed = True
             take = min(frames, self._size)
             if take:
@@ -319,6 +323,7 @@ class JitterBuffer:
                     self.underruns += 1
                     self._primed = self.prebuffer_frames == 0
                 self._fed = False
+            return int(take)
 
     def clear(self) -> None:
         with self._lock:
@@ -877,6 +882,13 @@ class SoundDeviceSink:
         self._hw_underruns = 0
         self._stream = None
         self._format_ready = False
+        # Callback clock. The stall watchdog treats a moving play head as progress
+        # so a long reply is not mistaken for a dead audio loop.
+        self.last_output_at = 0.0
+        self._audible_until = 0.0
+        self._stream_latency = self._configured_latency()
+        self.writing = False
+        self.write_started_at = 0.0
 
     def prepare(self) -> None:
         """Choose the device rate and channel count before the first sample."""
@@ -890,14 +902,19 @@ class SoundDeviceSink:
     def write(self, pcm: bytes) -> None:
         if self._stopped or not pcm:
             return
-        self.prepare()
-        self._ensure()
-        if self._resampler.from_rate != self.sample_rate or self._resampler.to_rate != self.device_rate:
-            self._resampler = StreamingResampler(self.sample_rate, self.device_rate)
-        self._source_bytes += len(pcm) - (len(pcm) % 2)
-        fitted = upmix(self._resampler.process(pcm), self.channels)
-        if fitted:
-            self.buffer.push(fitted)
+        self._begin_write()
+        try:
+            self.prepare()
+            self._ensure()
+            if self._resampler.from_rate != self.sample_rate or self._resampler.to_rate != self.device_rate:
+                self._resampler = StreamingResampler(self.sample_rate, self.device_rate)
+            self._source_bytes += len(pcm) - (len(pcm) % 2)
+            fitted = upmix(self._resampler.process(pcm), self.channels)
+            if fitted:
+                self.buffer.push(fitted)
+            self.last_output_at = time.monotonic()
+        finally:
+            self.writing = False
 
     def write_raw(self, pcm: bytes) -> None:
         """Queue mono PCM that is already at ``device_rate``.
@@ -907,14 +924,19 @@ class SoundDeviceSink:
         """
         if self._stopped or not pcm:
             return
-        self.prepare()
-        self._ensure()
-        usable = len(pcm) - (len(pcm) % 2)
-        if usable < 2:
-            return
-        fitted = upmix(pcm[:usable], self.channels)
-        if fitted:
-            self.buffer.push(fitted)
+        self._begin_write()
+        try:
+            self.prepare()
+            self._ensure()
+            usable = len(pcm) - (len(pcm) % 2)
+            if usable < 2:
+                return
+            fitted = upmix(pcm[:usable], self.channels)
+            if fitted:
+                self.buffer.push(fitted)
+            self.last_output_at = time.monotonic()
+        finally:
+            self.writing = False
 
     def audio_ms(self) -> int:
         rate = self.sample_rate or 1
@@ -955,11 +977,50 @@ class SoundDeviceSink:
         """Frames still waiting in the jitter buffer. Playback is not finished while this is above zero."""
         return int(self.buffer.buffered())
 
+    def audible_until(self) -> float:
+        """Monotonic time when the device has played what it has already been given.
+
+        Queued software frames are still ahead of the DAC. After the ring is empty
+        the stream latency is the hardware buffer that has not drained yet.
+        """
+        now = time.monotonic()
+        rate = float(self.device_rate or self.sample_rate or 1)
+        queued_s = self.queued_frames() / rate if rate else 0.0
+        hardware = float(self._audible_until)
+        if queued_s > 0:
+            return max(hardware, now + queued_s + self._latency_seconds())
+        return hardware
+
+    def _configured_latency(self) -> float:
+        raw = self.latency
+        if isinstance(raw, (int, float)) and float(raw) > 0:
+            return float(raw)
+        return 0.2
+
+    def _latency_seconds(self) -> float:
+        raw = self._stream_latency
+        if isinstance(raw, (int, float)) and float(raw) > 0:
+            return float(raw)
+        return self._configured_latency()
+
+    def _begin_write(self) -> None:
+        self.writing = True
+        self.write_started_at = time.monotonic()
+
+    def _mark_audible(self, copied: int) -> None:
+        """Remember when the frames just copied will leave the hardware buffer."""
+        if copied <= 0:
+            return
+        now = time.monotonic()
+        self.last_output_at = now
+        self._audible_until = now + self._latency_seconds()
+
     def stop(self) -> None:
         """Drop queued speech. The stream stays open; the next write does not reopen it."""
         self._stopped = True
         self.buffer.clear()
         self._resampler.reset()
+        self._audible_until = 0.0
 
     def resume(self) -> None:
         self._stopped = False
@@ -984,7 +1045,9 @@ class SoundDeviceSink:
             # Copy only. Resampling already happened in write(), off this thread.
             if status and getattr(status, "output_underflow", False):
                 self._hw_underruns += 1
-            self.buffer.pull_into(outdata)
+            copied = self.buffer.pull_into(outdata)
+            if copied:
+                self._mark_audible(copied)
 
         self._stream = sd.OutputStream(
             device=self.device,
@@ -996,6 +1059,13 @@ class SoundDeviceSink:
             callback=callback,
         )
         self._stream.start()
+        opened = getattr(self._stream, "latency", 0) or 0
+        try:
+            opened_s = float(opened)
+        except (TypeError, ValueError):
+            opened_s = 0.0
+        if opened_s > 0:
+            self._stream_latency = opened_s
 
 
 def _public_error(exc: BaseException) -> str:
