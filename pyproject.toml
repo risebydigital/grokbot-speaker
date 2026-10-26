@@ -55,6 +55,7 @@ gva = ["telemetry/event-1.0.0.json", "prompts/*.txt", "assets/*.wav"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 110

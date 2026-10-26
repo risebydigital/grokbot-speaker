@@ -1,7 +1,7 @@
 """Speech-to-speech session on xAI's realtime voice API.
 
 This is the conversation that already worked on the Pi: openWakeWord hears
-"hey jarvis", then a WebSocket to grok-voice-latest speaks and listens.
+the configured wake phrase, then a WebSocket to grok-voice-latest speaks and listens.
 The local whisper/Piper pipeline remains available as conversation.engine local.
 
 Wake behaviour that stopped the false re-trigger, kept as it was:

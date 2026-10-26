@@ -1,4 +1,8 @@
-"""Wake-word scoring. openWakeWord has no Milo model; the default phrase is hey jarvis.
+"""Wake-word scoring.
+
+The stock model is openWakeWord's hey_jarvis ("hey jarvis"). `wake.model: milo`
+loads the shipped Milo ONNX file, trained for "hey milo" with bare "milo" as a
+secondary phrase. If that file is missing, scoring falls back to hey_jarvis.
 
 Models are ONNX. tflite-runtime has no wheel for Python 3.13, so this process
 never asks openWakeWord for the TFLite interpreter.
@@ -6,11 +10,14 @@ never asks openWakeWord for the TFLite interpreter.
 
 from __future__ import annotations
 
+import shutil
+import sys
 import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+from gva.paths import project_root
 from gva.runtime.audio import rms
 
 # openWakeWord's own default is tflite. Milo always passes this instead.
@@ -173,12 +180,21 @@ class OpenWakeWordEngine:
         refractory_s: float,
         phrase: str,
     ):
-        self.model_spec = model
+        resolved, fell_back = resolve_wake_model(model, model_dir)
+        self.requested_model = model
+        self.fell_back = fell_back
+        self.model_spec = resolved
         self.model_dir = Path(model_dir)
         self.phrase = phrase
-        self.model_name = model
+        self.model_name = Path(resolved).name if resolved.endswith(".onnx") else resolved
         self.logic = ThresholdWake(threshold, patience, refractory_s)
         self._model = None
+        if fell_back:
+            print(
+                "milo.onnx was not found in the wake directory or in assets/wakewords. "
+                'Using hey_jarvis. Say "hey jarvis".',
+                file=sys.stderr,
+            )
 
     def score(self, frame: bytes) -> float:
         import numpy as np
@@ -253,6 +269,80 @@ def _force_cpu_provider() -> None:
     install_cpu_provider(ort)
 
 
-# What the owner can say before a Milo model exists.
+# Stock openWakeWord model. Used when no Milo file is configured, and when
+# wake.model is milo but milo.onnx is not on disk.
 DEFAULT_WAKE_PHRASE = "hey jarvis"
 DEFAULT_WAKE_MODEL = "hey_jarvis"
+MILO_WAKE_ID = "milo"
+MILO_FILENAME = "milo.onnx"
+
+
+def shipped_wake_model() -> Path:
+    """ONNX file shipped in the git tree. Deploy copies it to the wake directory."""
+    return project_root() / "assets" / "wakewords" / MILO_FILENAME
+
+
+def is_milo_model(model: str) -> bool:
+    return Path(model).name.lower() in {MILO_WAKE_ID, MILO_FILENAME}
+
+
+def resolve_wake_model(model: str, model_dir: str) -> tuple[str, bool]:
+    """Return `(spec, fell_back)`.
+
+    An existing ONNX path is used as-is. `milo` uses milo.onnx from the wake
+    directory, then the copy shipped in the repo. If neither file is there,
+    the spec is hey_jarvis and `fell_back` is true.
+    """
+    candidate = Path(model)
+    if candidate.suffix == ".onnx":
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return str(candidate), False
+        except OSError:
+            pass
+    if not is_milo_model(model):
+        return model, False
+    search = [Path(model_dir) / MILO_FILENAME, shipped_wake_model()]
+    for path in search:
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                return str(path), False
+        except OSError:
+            continue
+    return DEFAULT_WAKE_MODEL, True
+
+
+def copy_shipped_milo(model_dir: str | Path) -> Path | None:
+    """Copy the shipped Milo model into the wake directory. Missing source is not an error."""
+    source = shipped_wake_model()
+    try:
+        if not source.is_file() or source.stat().st_size <= 0:
+            return None
+        dest = Path(model_dir) / MILO_FILENAME
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.resolve() != source.resolve():
+            same = dest.is_file() and dest.stat().st_size == source.stat().st_size
+            if not same:
+                shutil.copyfile(source, dest)
+        return dest
+    except OSError:
+        return None
+
+
+def format_wake_line(elapsed_s: float, score: float, fired: bool) -> str:
+    mark = "WAKE" if fired else "."
+    return f"{elapsed_s:6.2f}s  score={score:.3f}  {mark}"
+
+
+def score_report(engine: Any, frames: list[bytes], chunk_s: float = 0.08) -> tuple[list[str], float]:
+    """Score already-captured frames. Returns lines and the maximum score."""
+    lines: list[str] = []
+    peak = 0.0
+    elapsed = 0.0
+    for frame in frames:
+        score = float(engine.score(frame))
+        fired = bool(engine.observe(score))
+        peak = max(peak, score)
+        lines.append(format_wake_line(elapsed, score, fired))
+        elapsed += chunk_s
+    return lines, peak

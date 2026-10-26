@@ -26,6 +26,7 @@ if id gva >/dev/null 2>&1; then
   chown -R gva:gva "$APP"
 fi
 install_voice_python /opt/gva/venv/bin/pip "$APP"
+install_shipped_wake_model "$APP"
 if id gva >/dev/null 2>&1 && getent group audio >/dev/null; then
   usermod -aG audio gva
 fi

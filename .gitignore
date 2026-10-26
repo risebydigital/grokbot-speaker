@@ -33,6 +33,8 @@ build/
 models/
 *.onnx
 *.onnx.json
+# The Milo wake model is trained in CI-less local runs and shipped on purpose.
+!assets/wakewords/milo.onnx
 *.tflite
 *.wav
 !gva/assets/fallback-not-connected.wav

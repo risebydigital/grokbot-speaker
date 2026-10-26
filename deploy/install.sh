@@ -63,6 +63,7 @@ fi
 # shellcheck disable=SC1091
 source "$REPO/deploy/voice-packages.sh"
 install_voice_python "$VENV/bin/pip" "$APP"
+install_shipped_wake_model "$APP"
 ln -sfn "$VENV/bin/gva" /usr/local/bin/gva
 
 if [[ ! -f /etc/gva/config.yaml ]]; then
