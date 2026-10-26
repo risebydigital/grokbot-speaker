@@ -14,7 +14,8 @@
       "config.changed", "budget.threshold", "budget.degraded", "eval.case", "eval.summary",
       "sync.completed", "audio.device_lost",
       "bridge.sent", "bridge.answered", "bridge.timeout", "bridge.error",
-      "bridge.spoken", "bridge.delivery_failed"
+      "bridge.spoken", "bridge.delivery_failed", "bridge.timeout_spoken",
+      "bridge.late_delivered", "bridge.deferred", "bridge.nudged"
     ]},
     "ts": {"type": "string", "format": "date-time"},
     "mono_ms": {"type": "integer", "minimum": 0},

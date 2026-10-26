@@ -263,6 +263,12 @@ class BotBridgeConfig(BaseModel):
     context_table: str = "milo_context"
     # Ignore a digest older than this. Six hours.
     context_max_age_s: int = Field(default=21600, ge=60, le=604800)
+    # Offer digest items while waiting. Separate from chat_while_waiting.
+    suggest_pending_items: bool = True
+    # "HH:MM-HH:MM" in the device timezone. "none" is off. A window may wrap midnight.
+    nudge_quiet_hours: str = "none"
+    # Mic stays open this long after an unsolicited nudge, for "thanks" or a new question.
+    nudge_follow_up_s: int = Field(default=8, ge=1, le=60)
 
 
 class Config(BaseModel):

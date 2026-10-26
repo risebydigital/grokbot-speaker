@@ -29,7 +29,14 @@ from typing import Any
 from gva.config import Config, env_value
 from gva.ids import new_ulid, utc_now_ms
 from gva.runtime.audio import FALLBACK_PHRASE, play_fallback_phrase, resample_pcm
-from gva.runtime.bridge import NOT_YET_LINE, UNREACHABLE_LINE, WAITING_LINE
+from gva.runtime.bridge import (
+    DEFER_LINE,
+    NOT_YET_LINE,
+    UNREACHABLE_LINE,
+    WAITING_LINE,
+    is_defer_phrase,
+    is_suggestion_decline,
+)
 from gva.runtime.conversation import render_system
 from gva.runtime.textutil import is_stop_phrase
 from gva.telemetry.events import EventLog
@@ -99,6 +106,8 @@ class RealtimeProtocol:
         self._need_response_create = False
         self._bridge_ack_pending = False
         self._bridge_ack_phrase = ""
+        self._defer_close_armed = False
+        self._close_after_reply = False
         self._response_instructions: str | None = None
         self._response_active = False
         self._bridge_items: list[dict[str, Any]] = []
@@ -169,6 +178,25 @@ class RealtimeProtocol:
             self.note_activity()
             self._user_text = event.get("transcript") or ""
             self._emit_stt(self._user_text)
+            bridge = self._live_bridge()
+            pending = (
+                bridge is not None
+                and callable(getattr(bridge, "answer_pending", None))
+                and bridge.answer_pending()
+            )
+            if pending and is_defer_phrase(self._user_text):
+                bridge.defer()
+                return self._defer_reply_messages()
+            if pending and is_suggestion_decline(self._user_text):
+                bridge.decline_suggestions()
+                if self._response_active:
+                    return [self.cancel_playback()]
+                self.speaking = False
+                self.drain_playback()
+                resume = getattr(self.sink, "resume", None)
+                if resume:
+                    resume()
+                return []
             if mentions_stop(self._user_text, self.cfg.conversation.stop_phrases):
                 self.speaking = False
                 self.drain_playback()
@@ -206,6 +234,9 @@ class RealtimeProtocol:
                     self._response_active = False
                 return [message]
             self._response_active = False
+            if self._close_after_reply:
+                self._close_after_reply = False
+                self.close = True
             return []
         if etype == "response.function_call_arguments.done":
             self.note_activity()
@@ -301,9 +332,10 @@ class RealtimeProtocol:
         self.events.emit("tool.started", tool_name=name, tool_call_id=call_id)
         outcome = self.tools.run(call_id, name, arguments)
         self._tools.append(name)
-        if name in {"ask_rbd_team", "check_team_answer"}:
+        if name in {"ask_rbd_team", "check_team_answer", "defer_until_answer"}:
             # Questions and answers are personal. Keep them out of the event log.
             outcome.args_redacted = {}
+        suppress_reply = False
         if name == "ask_rbd_team":
             if outcome.result.get("status") == "sent":
                 phrase = WAITING_LINE
@@ -333,6 +365,18 @@ class RealtimeProtocol:
                 self._response_instructions = f"Say only: {phrase}"
             self._bridge_ack_pending = True
             self._bridge_ack_phrase = phrase
+        elif name == "defer_until_answer":
+            if outcome.result.get("status") == "deferred":
+                if self._defer_close_armed:
+                    # The confirm line is already queued. Do not say it twice.
+                    suppress_reply = True
+                else:
+                    self._arm_defer_close()
+            else:
+                phrase = "Nothing is waiting from the team."
+                self._response_instructions = f"Say only: {phrase}"
+                self._bridge_ack_pending = True
+                self._bridge_ack_phrase = phrase
         level = "info" if outcome.status == "ok" else "warning"
         if outcome.rejected:
             self.events.emit(
@@ -358,7 +402,8 @@ class RealtimeProtocol:
             )
         # Hand the result back now. response.create waits for response.done so the
         # server is not asked to speak while this response is still open.
-        self._need_response_create = True
+        if not suppress_reply:
+            self._need_response_create = True
         return [
             {
                 "type": "conversation.item.create",
@@ -468,23 +513,68 @@ class RealtimeProtocol:
                 return False
         return False
 
-    def _waiting_items(self) -> list[dict[str, Any]]:
-        if not self.cfg.bot_bridge.chat_while_waiting:
+    def _live_bridge(self):
+        tools = self.tools
+        if tools is None:
+            return None
+        return getattr(getattr(tools, "ctx", None), "bridge", None)
+
+    def _arm_defer_close(self) -> None:
+        self._defer_close_armed = True
+        self._close_after_reply = True
+        self._response_instructions = f"Say only: {DEFER_LINE}"
+        self._bridge_ack_pending = True
+        self._bridge_ack_phrase = DEFER_LINE
+
+    def _defer_reply_messages(self) -> list[dict[str, Any]]:
+        """One confirm line, then the session ends. A second request does not speak again."""
+        if self._defer_close_armed:
             return []
-        bridge = getattr(self.tools, "ctx", None)
-        bridge = getattr(bridge, "bridge", None)
+        self._arm_defer_close()
+        if self._response_active:
+            self._need_response_create = True
+            return [self.cancel_playback()]
+        if self._need_response_create:
+            return []
+        self._response_instructions = None
+        return [{"type": "response.create", "response": {"instructions": f"Say only: {DEFER_LINE}"}}]
+
+    def _waiting_items(self) -> list[dict[str, Any]]:
+        if not self.cfg.bot_bridge.chat_while_waiting or not self.cfg.bot_bridge.suggest_pending_items:
+            return []
+        bridge = self._live_bridge()
         if bridge is None or not hasattr(bridge, "waiting_context"):
             return []
+        if hasattr(bridge, "suggestions_allowed") and not bridge.suggestions_allowed():
+            return []
         try:
-            items = bridge.waiting_context() or []
+            items = list(bridge.waiting_context() or [])
         except Exception:
             return []
-        return list(items)[:8]
+        items = items[:2]
+        if items and hasattr(bridge, "note_suggestions_offered"):
+            bridge.note_suggestions_offered()
+        return items
 
-    def enqueue_bridge(self, messages: list[dict[str, Any]], text: str, request_id: str = "") -> None:
+    def enqueue_bridge(
+        self,
+        messages: list[dict[str, Any]],
+        text: str,
+        request_id: str = "",
+        kind: str = "answer",
+        chime: bool = True,
+    ) -> None:
         with self._bridge_lock:
             self._bridge_items.append(
-                {"messages": messages, "text": text, "request_id": request_id, "sent": False, "confirmed": False}
+                {
+                    "messages": messages,
+                    "text": text,
+                    "request_id": request_id,
+                    "kind": kind,
+                    "chime": chime,
+                    "sent": False,
+                    "confirmed": False,
+                }
             )
 
     def pop_bridge_ready(self) -> dict[str, Any] | None:
@@ -522,7 +612,12 @@ class RealtimeProtocol:
                     pending.append(item)
             self._bridge_items.clear()
             return [
-                {"request_id": str(item.get("request_id") or ""), "text": str(item.get("text") or "")}
+                {
+                    "request_id": str(item.get("request_id") or ""),
+                    "text": str(item.get("text") or ""),
+                    "kind": str(item.get("kind") or "answer"),
+                    "chime": bool(item.get("chime", True)),
+                }
                 for item in pending
                 if item.get("text")
             ]
@@ -722,7 +817,12 @@ class RealtimeAssistant:
         self.tools = tools
         self.connector = connector
         self.bridge = bridge
-        self._bridge_leftover: list[str] = []
+        self._bridge_leftover: list[Any] = []
+        self._follow_up = threading.Event()
+        self._silence_override_s: float | None = None
+        self._session_silence_s: float | None = None
+        if bridge is not None:
+            bridge.on_follow_up = self._follow_up.set
         self.shutdown = __import__("threading").Event()
         self._last_heartbeat = time.monotonic()
         self.sessions = 0
@@ -779,10 +879,20 @@ class RealtimeAssistant:
             if isinstance(item, str):
                 self.bridge.speak_unconfirmed("", item)
             else:
-                self.bridge.speak_unconfirmed(item.get("request_id") or "", item.get("text") or "")
+                self.bridge.speak_unconfirmed(
+                    item.get("request_id") or "",
+                    item.get("text") or "",
+                    chime=bool(item.get("chime", True)),
+                    kind=str(item.get("kind") or "answer"),
+                )
 
     def _wait_for_wake(self) -> bool:
         while not self.shutdown.is_set():
+            if self._follow_up.is_set():
+                self._follow_up.clear()
+                seconds = getattr(self.cfg.bot_bridge, "nudge_follow_up_s", None)
+                self._silence_override_s = float(seconds if seconds else 8)
+                return True
             frame = self.capture.read(0.2)
             if frame is None:
                 return False
@@ -814,6 +924,8 @@ class RealtimeAssistant:
             flush()
         voice = self.cfg.conversation.realtime
         url = voice.url.rstrip("/") + f"?model={voice.model}"
+        self._session_silence_s = self._silence_override_s
+        self._silence_override_s = None
         protocol = RealtimeProtocol(self.cfg, self.events, self.store, self.tools, self.sink)
         self.events.ctx.session_id = protocol.session_id
         if self.bridge is not None:
@@ -833,6 +945,7 @@ class RealtimeAssistant:
             async with socket as ws:
                 await self._run_socket(ws, protocol, aec, started)
         finally:
+            self._session_silence_s = None
             protocol.close = True
             if self.bridge is not None:
                 # Speak outside this event loop so a closed session can open a short one.
@@ -930,7 +1043,8 @@ class RealtimeAssistant:
         voice = self.cfg.conversation.realtime
         while not protocol.close and not self.shutdown.is_set():
             # Idle follows server conversation events. A live microphone must not refresh it.
-            if idle_should_close(protocol, self.bridge, time.monotonic(), voice.silence_timeout_s):
+            silence_s = self._session_silence_s if self._session_silence_s is not None else voice.silence_timeout_s
+            if idle_should_close(protocol, self.bridge, time.monotonic(), silence_s):
                 protocol.close = True
                 await _close_socket(ws)
                 return

@@ -228,3 +228,11 @@ bot_bridge:
   chat_while_waiting: true
   context_table: milo_context
   context_max_age_s: 21600
+  # Mention one or two digest items, once, while waiting. false keeps the
+  # call open but never offers items. Separate from chat_while_waiting.
+  suggest_pending_items: true
+  # Unsolicited nudges wait during this window (device timezone). none is off.
+  # A window may wrap midnight, for example "22:00-07:00".
+  nudge_quiet_hours: none
+  # After a nudge, the mic stays open this many seconds for a follow-up.
+  nudge_follow_up_s: 8
