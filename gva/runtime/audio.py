@@ -721,6 +721,23 @@ class SoundDeviceSink:
         if fitted:
             self.buffer.push(fitted)
 
+    def write_raw(self, pcm: bytes) -> None:
+        """Queue mono PCM that is already at ``device_rate``.
+
+        ``write`` resamples from the source rate. A chime is resampled on its
+        own, including the filter tail, and must not pass through that again.
+        """
+        if self._stopped or not pcm:
+            return
+        self.prepare()
+        self._ensure()
+        usable = len(pcm) - (len(pcm) % 2)
+        if usable < 2:
+            return
+        fitted = upmix(pcm[:usable], self.channels)
+        if fitted:
+            self.buffer.push(fitted)
+
     def audio_ms(self) -> int:
         rate = self.sample_rate or 1
         return int(self._source_bytes / 2 / rate * 1000)

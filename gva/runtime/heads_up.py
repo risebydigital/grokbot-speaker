@@ -320,17 +320,13 @@ class MeetingHeadsUp:
         sink = self.sink
         if sink is None:
             return
-        from gva.runtime.audio import tone
+        from gva.runtime.chime import play_chime
 
         self.last_chime = "soft"
-        rate = int(getattr(sink, "sample_rate", 0) or 24000)
-        pcm = tone(50, 523, amp=1800, sample_rate=rate) + tone(70, 784, amp=1800, sample_rate=rate)
-        from gva.runtime.audio import play_pcm
-
         with self._lock:
             protocol = self._protocol
         try:
-            play_pcm(sink, pcm, rate, protocol)
+            play_chime(sink, self.cfg, protocol=protocol)
         except Exception:
             return
 
