@@ -279,9 +279,11 @@ class JitterBuffer:
                 # A short final block is the tail of the reply. Counting that and
                 # the idle callback after it reported two underruns on every turn.
                 # Only a callback that receives nothing, while audio was still
-                # expected, is a gap.
+                # expected, is a gap. The pre-buffer then fills again so the next
+                # chunk is not played as a trickle of tiny pieces.
                 if take == 0:
                     self.underruns += 1
+                    self._primed = self.prebuffer_frames == 0
                 self._fed = False
         return out
 
@@ -373,23 +375,64 @@ def resolve_device(substring: str, kind: str) -> int | None:
 
 
 class SoundDeviceCapture:
-    """Dedicated capture thread. A full queue drops the oldest frame rather than blocking audio."""
+    """Capture callback plus a supervisor that reopens the device after an error or EOF.
 
-    def __init__(self, device: int | None, sample_rate: int, chunk_ms: int, on_lost=None):
+    The callback only copies samples. Resampling happens in `read`, so a slow
+    resampler cannot stall PortAudio. `read` waits on the queue; it never
+    reopens the device and never spins. The supervisor thread does that, with a
+    sleep between attempts. `stop` aborts the stream instead of waiting for the
+    callback, which is the PortAudio path that busy-waits forever if the
+    callback is stuck.
+    """
+
+    def __init__(self, device: int | None, sample_rate: int, chunk_ms: int, on_lost=None, on_error=None):
         self.device = device
         self.sample_rate = sample_rate
         self.chunk_ms = chunk_ms
         self.on_lost = on_lost
+        self.on_error = on_error
         self.device_rate = sample_rate
         self.device_channels = 1
+        now = time.monotonic()
+        self.last_audio_at = now
+        self._opened_at = now
+        self.reopen_delay = 0.5
+        self._lock = threading.Lock()
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=32)
         self._stream = None
-        self._lost = threading.Event()
+        self._running = False
+        self._stopped = threading.Event()
+        self._failed = threading.Event()
+        self._error: BaseException | None = None
+        self._reported: BaseException | None = None
+        self._supervisor: threading.Thread | None = None
+        self._resampler: StreamingResampler | None = None
+        self._calls = 0
+        self._rate_window_start = time.monotonic()
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def queued(self) -> int:
+        with self._lock:
+            q = self._queue
+        return int(q.qsize())
 
     def start(self) -> None:
+        self._stopped.clear()
+        self._running = True
+        self.last_audio_at = time.monotonic()
+        self._open_stream()
+        self._ensure_supervisor()
+
+    def _open_stream(self) -> None:
+        if not self._running or self._stopped.is_set():
+            return
         import sounddevice as sd
 
         self.device_rate, self.device_channels = probe_input(self.device, self.sample_rate)
+        self._resampler = StreamingResampler(self.device_rate, self.sample_rate)
         block = chunk_samples(self.device_rate, self.chunk_ms)
         self._stream = sd.InputStream(
             device=self.device,
@@ -400,58 +443,238 @@ class SoundDeviceCapture:
             callback=self._on_audio,
         )
         self._stream.start()
+        self._failed.clear()
+        self._error = None
+        self._reported = None
+        self.reopen_delay = 0.5
+        # A new stream gets a few seconds to deliver its first callback.
+        # last_audio_at stays on the last real callback so a device that opens
+        # and then stays silent can still trip the stall watchdog.
+        self._opened_at = time.monotonic()
 
     def _on_audio(self, indata, frames, time_info, status) -> None:
-        if status:
-            self._lost.set()
-        pcm = fit_capture(indata, self.device_rate, self.sample_rate)
         try:
-            self._queue.put_nowait(pcm)
+            count = int(frames or 0)
+            if self._callback_spinning():
+                self._halt(RuntimeError("capture callback spun after the device closed"))
+            if count <= 0 or indata is None or np.size(indata) == 0:
+                self._halt(EOFError("capture stream ended"))
+            if status:
+                text = str(status)
+                # One input overflow is normal if the consumer hiccups. Anything
+                # else means the device is gone.
+                if "overflow" not in text.casefold():
+                    self._halt(RuntimeError(text or "capture device error"))
+            pcm = _downmix_int16(indata)
+            if not pcm:
+                self._halt(EOFError("capture stream ended"))
+            self.last_audio_at = time.monotonic()
+            self._put(pcm)
+        except Exception as exc:
+            if exc.__class__.__name__ == "CallbackStop" or getattr(exc, "_capture_halt", False):
+                raise
+            self._halt(exc)
+
+    def _callback_spinning(self) -> bool:
+        """True when PortAudio is invoking the callback far faster than realtime."""
+        self._calls += 1
+        now = time.monotonic()
+        if now - self._rate_window_start < 1.0:
+            return False
+        calls = self._calls
+        self._calls = 0
+        self._rate_window_start = now
+        expected = max(1, int(round(1000 / max(1, self.chunk_ms))))
+        return calls > max(80, expected * 8)
+
+    def _halt(self, exc: BaseException) -> None:
+        self._fail(exc)
+        try:
+            import sounddevice as sd
+        except Exception:
+            marker = RuntimeError(str(exc))
+            setattr(marker, "_capture_halt", True)
+            raise marker from exc
+        raise sd.CallbackStop from exc
+
+    def _fail(self, exc: BaseException) -> None:
+        self._error = exc
+        self._failed.set()
+
+    def _put(self, pcm: bytes) -> None:
+        with self._lock:
+            q = self._queue
+        try:
+            q.put_nowait(pcm)
         except queue.Full:
             try:
-                self._queue.get_nowait()
+                q.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._queue.put_nowait(pcm)
+                q.put_nowait(pcm)
             except queue.Full:
                 pass
 
     def read(self, timeout: float = 0.2, nowait: bool = False) -> bytes | None:
-        if self._lost.is_set():
-            self._lost.clear()
-            if self.on_lost:
-                self.on_lost()
-            self._reopen()
+        with self._lock:
+            q = self._queue
         try:
-            if nowait:
-                return self._queue.get_nowait()
-            return self._queue.get(timeout=timeout)
+            raw = q.get_nowait() if nowait else q.get(timeout=timeout)
         except queue.Empty:
             return b""
+        return self._to_capture_rate(raw)
+
+    def _to_capture_rate(self, pcm: bytes) -> bytes:
+        resampler = self._resampler
+        if resampler is None or resampler.from_rate == resampler.to_rate:
+            return pcm
+        return resampler.process(pcm)
+
+    def _ensure_supervisor(self) -> None:
+        thread = self._supervisor
+        if thread is not None and thread.is_alive():
+            return
+        self._supervisor = threading.Thread(target=self._supervise, name="gva-capture", daemon=True)
+        self._supervisor.start()
+
+    def _supervise(self) -> None:
+        while not self._stopped.wait(0.5):
+            try:
+                self._supervise_once()
+            except Exception as exc:
+                self._fail(exc)
+                self._report(exc)
+
+    def _supervise_once(self) -> None:
+        if not self._running:
+            return
+        stream = self._stream
+        inactive = stream is None or not bool(getattr(stream, "active", False))
+        # Callbacks carry silence too. No callback means the stream died without an error.
+        # A stream that just opened is given the same 5s before it counts as dead.
+        quiet_since = max(float(self.last_audio_at), float(self._opened_at))
+        silent = (time.monotonic() - quiet_since) > 5.0
+        if silent and not self._failed.is_set():
+            self._fail(TimeoutError("capture produced no audio"))
+        if not self._failed.is_set() and not inactive:
+            return
+        self._reopen()
 
     def _reopen(self) -> None:
-        time.sleep(5)
+        if not self._running or self._stopped.is_set():
+            return
+        exc = self._error if self._error is not None else EOFError("capture stream ended")
+        self._failed.clear()
+        delay = float(self.reopen_delay or 0)
+        if delay > 0:
+            time.sleep(delay)
+        if not self._running or self._stopped.is_set():
+            return
+        self._close_stream()
         try:
-            if self._stream is not None:
-                self._stream.stop()
-                self._stream.close()
-            self.start()
+            self._open_stream()
+        except Exception as open_exc:
+            self._fail(open_exc)
+            self.reopen_delay = min(5.0, max(0.5, delay * 2 or 0.5))
+            exc = open_exc
+        if self._running and not self._stopped.is_set():
+            self._report(exc)
+
+    def _report(self, exc: BaseException) -> None:
+        if self._reported is exc:
+            return
+        self._reported = exc
+        try:
+            if self.on_error is not None:
+                self.on_error(exc)
+            elif self.on_lost is not None:
+                self.on_lost()
         except Exception:
-            self._lost.set()
+            return
 
     def flush(self) -> None:
-        while True:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                return
+        """Drop queued frames without spinning if the callback is still producing them."""
+        with self._lock:
+            self._queue = queue.Queue(maxsize=32)
 
     def stop(self) -> None:
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        self._running = False
+        self._stopped.set()
+        self._close_stream()
+        thread = self._supervisor
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._supervisor = None
+
+    def _close_stream(self) -> None:
+        stream = self._stream
+        self._stream = None
+        if stream is None:
+            return
+        abort = getattr(stream, "abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except Exception as exc:
+                self._fail(exc)
+        closer = getattr(stream, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception as exc:
+                self._fail(exc)
+
+
+def _downmix_int16(indata) -> bytes:
+    """Copy one callback's samples to mono PCM16. No resampling."""
+    audio = np.asarray(indata)
+    if audio.size == 0:
+        return b""
+    if audio.dtype == np.int16 and (audio.ndim == 1 or (audio.ndim == 2 and audio.shape[1] == 1)):
+        return np.ascontiguousarray(audio.reshape(-1)).tobytes()
+    if audio.ndim == 2 and audio.shape[1] > 1:
+        mono = audio.astype(np.float64).mean(axis=1)
+    elif audio.ndim == 2:
+        mono = audio[:, 0]
+    else:
+        mono = audio.reshape(-1)
+    return np.clip(np.round(mono), -32768, 32767).astype(np.int16).tobytes()
+
+
+def play_pcm(sink, pcm: bytes, rate: int, protocol=None) -> None:
+    """Play mono PCM through the one speaker path.
+
+    While the realtime player task is running it is the only writer: chimes,
+    Piper and bridge clips join that queue and meet the same jitter pre-buffer.
+    With no player running, the sink's own pre-buffer is the playback path.
+    """
+    if not pcm:
+        return
+    if (
+        protocol is not None
+        and getattr(protocol, "player_live", False)
+        and not getattr(protocol, "close", True)
+    ):
+        enqueue = getattr(protocol, "enqueue_pcm", None)
+        if callable(enqueue):
+            voice = int(getattr(getattr(protocol, "sink", None), "sample_rate", 0) or rate or 0)
+            if voice and rate and rate != voice:
+                pcm = resample_pcm(pcm, rate, voice)
+            enqueue(pcm)
+            return
+    if sink is None:
+        return
+    target = int(getattr(sink, "sample_rate", 0) or rate or 0)
+    if target and rate and rate != target:
+        pcm = resample_pcm(pcm, rate, target)
+    resume = getattr(sink, "resume", None)
+    if callable(resume):
+        try:
+            resume()
+        except Exception:
+            pass
+    sink.write(pcm)
 
 
 class SoundDeviceSink:
@@ -461,7 +684,7 @@ class SoundDeviceSink:
         self,
         device: int | None,
         sample_rate: int,
-        prebuffer_ms: int = 200,
+        prebuffer_ms: int = 250,
         latency: str = "high",
     ):
         self.device = device

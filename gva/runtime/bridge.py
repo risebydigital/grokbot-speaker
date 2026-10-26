@@ -1316,22 +1316,14 @@ class BotBridge:
         self._write_pcm(pcm, rate)
 
     def _write_pcm(self, pcm: bytes, rate: int) -> None:
-        sink = self.sink
-        if sink is None or not pcm:
+        if not pcm:
             return
-        target = int(getattr(sink, "sample_rate", 0) or self.pcm_rate or rate)
-        if rate != target and pcm:
-            from gva.runtime.audio import resample_pcm
+        from gva.runtime.audio import play_pcm
 
-            pcm = resample_pcm(pcm, rate, target)
-        resume = getattr(sink, "resume", None)
-        if resume:
-            try:
-                resume()
-            except Exception:
-                pass
+        with self._lock:
+            protocol = self._protocol
         try:
-            sink.write(pcm)
+            play_pcm(self.sink, pcm, rate, protocol)
         except Exception:
             return
 

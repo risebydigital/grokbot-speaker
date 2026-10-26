@@ -24,7 +24,8 @@ audio:
   aec_enabled: true
   aec_delay_ms: 80
   # Queue this much device-rate audio before the callback leaves silence.
-  playback_prebuffer_ms: 200
+  # After an underrun the same cushion fills again before sound resumes.
+  playback_prebuffer_ms: 250
   # PortAudio latency hint for the USB speaker. high or low.
   playback_latency: high
 
@@ -128,6 +129,8 @@ conversation:
     # Hang up when the server has been quiet for this long. Microphone noise does not reset it.
     silence_timeout_s: 15
     watchdog_s: 30
+    # Mic stays open this long after the speaker has finished, not after audio was queued.
+    listen_after_playback_s: 8
     audio_usd_per_minute: 0.08
     text_usd_per_message: 0.004
   follow_up_seconds: 6

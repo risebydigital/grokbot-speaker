@@ -306,8 +306,12 @@ class MeetingHeadsUp:
             return False
         if not pcm or self.sink is None:
             return False
+        from gva.runtime.audio import play_pcm
+
+        with self._lock:
+            protocol = self._protocol
         try:
-            self.sink.write(pcm)
+            play_pcm(self.sink, pcm, rate, protocol)
         except Exception:
             return False
         return True
@@ -321,11 +325,12 @@ class MeetingHeadsUp:
         self.last_chime = "soft"
         rate = int(getattr(sink, "sample_rate", 0) or 24000)
         pcm = tone(50, 523, amp=1800, sample_rate=rate) + tone(70, 784, amp=1800, sample_rate=rate)
+        from gva.runtime.audio import play_pcm
+
+        with self._lock:
+            protocol = self._protocol
         try:
-            resume = getattr(sink, "resume", None)
-            if resume:
-                resume()
-            sink.write(pcm)
+            play_pcm(sink, pcm, rate, protocol)
         except Exception:
             return
 

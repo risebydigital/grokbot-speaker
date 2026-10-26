@@ -34,8 +34,9 @@ class AudioConfig(BaseModel):
     aec_enabled: bool = True
     aec_delay_ms: int = 80
     # How much device-rate audio to queue before the callback leaves silence.
-    # 200 ms sits in the 150-250 ms range that keeps a USB speaker from stuttering.
-    playback_prebuffer_ms: int = 200
+    # 250 ms sits in the 200-300 ms range that keeps a USB speaker from stuttering.
+    # After an underrun the buffer fills to this depth again before sound resumes.
+    playback_prebuffer_ms: int = 250
     # PortAudio hint. "high" suits the Sanyun USB card. "low" is the other allowed value.
     playback_latency: Literal["high", "low"] = "high"
 
@@ -142,6 +143,9 @@ class RealtimeConfig(BaseModel):
     # Close the socket if the server sends nothing at all. Separate from silence_timeout_s,
     # which follows conversation events rather than microphone frames.
     watchdog_s: float = 30
+    # Keep the microphone hot this long after the speaker has actually finished,
+    # including a digest or bridge answer. Not measured from when audio was queued.
+    listen_after_playback_s: float = 8
     audio_usd_per_minute: float = 0.08
     text_usd_per_message: float = 0.004
 

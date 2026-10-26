@@ -95,18 +95,27 @@ def _telemetry(cfg: Config) -> tuple[Store, EventLog]:
 
 
 def _capture(cfg: Config, events: EventLog, sample_rate: int) -> SoundDeviceCapture:
-    def on_lost() -> None:
+    def on_error(exc: BaseException) -> None:
+        text = f"{exc.__class__.__name__}: {exc}"
+        if "Bearer" in text or "xai-" in text:
+            text = exc.__class__.__name__
         events.emit(
-            "audio.device_lost",
+            "error",
             level="error",
-            message="The microphone stream stopped. Reopening.",
+            category="audio",
+            error_code="audio.capture",
+            message=text[:300],
+            stage="capture",
+            retryable=True,
+            retry_count=0,
+            fallback_spoken=False,
         )
 
     return SoundDeviceCapture(
         resolve_device(cfg.audio.input_device, "input"),
         sample_rate,
         cfg.audio.chunk_ms,
-        on_lost=on_lost,
+        on_error=on_error,
     )
 
 

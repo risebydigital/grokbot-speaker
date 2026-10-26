@@ -66,6 +66,20 @@ def test_jitter_prebuffer_and_underrun_silence():
     assert buffer.underruns == drained
 
 
+def test_prebuffer_refills_after_an_underrun():
+    buffer = JitterBuffer(prebuffer_frames=100, channels=1)
+    buffer.push(np.ones(100, dtype=np.int16).tobytes())
+    assert int(buffer.pull(100).sum()) > 0
+    assert int(buffer.pull(10).sum()) == 0
+    assert buffer.underruns == 1
+    # A short chunk after the gap waits until the cushion is back.
+    buffer.push(np.ones(40, dtype=np.int16).tobytes())
+    assert int(buffer.pull(10).sum()) == 0
+    assert buffer.underruns == 1
+    buffer.push(np.ones(60, dtype=np.int16).tobytes())
+    assert int(buffer.pull(10).sum()) > 0
+
+
 def test_sink_keeps_one_stream_and_prebuffers():
     sink = SoundDeviceSink(0, 24000, prebuffer_ms=200, latency="high")
     assert sink.prebuffer_ms == 200
@@ -92,7 +106,7 @@ def test_fallback_phrase_is_bundled_audio():
 
 def test_playback_config_defaults():
     cfg = load_config(project_root() / "config" / "config.example.yaml")
-    assert cfg.audio.playback_prebuffer_ms == 200
+    assert cfg.audio.playback_prebuffer_ms == 250
     assert cfg.audio.playback_latency == "high"
 
 

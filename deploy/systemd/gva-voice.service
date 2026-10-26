@@ -19,7 +19,9 @@ Environment=GVA_CONFIG=/etc/gva/config.yaml
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=/etc/gva/gva.env
 ExecStart=/opt/gva/venv/bin/gva run
-Restart=on-failure
+# The process exits non-zero if capture or the wake loop stalls, so this
+# restarts a hang as well as a crash. Start limits live in [Unit].
+Restart=always
 RestartSec=3
 Nice=-5
 MemoryMax=2560M
