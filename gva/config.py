@@ -271,6 +271,17 @@ class BotBridgeConfig(BaseModel):
     nudge_follow_up_s: int = Field(default=8, ge=1, le=60)
 
 
+class HeadsUpConfig(BaseModel):
+    """A soft chime before a meeting from the milo_context digest.
+
+    Quiet hours, when set, are bot_bridge.nudge_quiet_hours. A meeting whose
+    due is not ISO 8601 with an offset is ignored.
+    """
+
+    enabled: bool = True
+    minutes_before: int = Field(default=10, ge=1, le=180)
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -291,6 +302,7 @@ class Config(BaseModel):
     backend: BackendConfig = Field(default_factory=BackendConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     bot_bridge: BotBridgeConfig = Field(default_factory=BotBridgeConfig)
+    heads_up: HeadsUpConfig = Field(default_factory=HeadsUpConfig)
     source_path: Path | None = Field(default=None, exclude=True)
     source_data: dict[str, Any] = Field(default_factory=dict, exclude=True)
 

@@ -781,6 +781,8 @@ def test_example_files_document_the_bridge(monkeypatch):
     assert cfg.bot_bridge.suggest_pending_items is True
     assert cfg.bot_bridge.nudge_quiet_hours == "none"
     assert cfg.bot_bridge.nudge_follow_up_s == 8
+    assert cfg.heads_up.enabled is True
+    assert cfg.heads_up.minutes_before == 10
     example = (project_root() / "gva.env.example").read_text(encoding="utf-8")
     assert "GVA_GROKBOT_WEBHOOK_URL=\n" in example
     assert "GVA_GROKBOT_WEBHOOK_KEY=\n" in example
@@ -797,6 +799,8 @@ def test_example_files_document_the_bridge(monkeypatch):
     assert "chat_while_waiting" in readme
     assert "suggest_pending_items" in readme
     assert "nudge_quiet_hours" in readme
+    assert "heads_up.minutes_before" in readme
+    assert "heads_up.scheduled" in readme
     assert "defer_until_answer" in readme
     assert "I couldn't get an answer from the team this time" in readme
     assert "By the way, Brenda came back" in readme

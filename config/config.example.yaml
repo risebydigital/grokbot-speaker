@@ -236,3 +236,10 @@ bot_bridge:
   nudge_quiet_hours: none
   # After a nudge, the mic stays open this many seconds for a follow-up.
   nudge_follow_up_s: 8
+
+# Meetings in the latest fresh milo_context digest. due must be ISO 8601 with
+# an offset. note "With Sarah Park, Park Lane" becomes the spoken name.
+# Quiet hours are bot_bridge.nudge_quiet_hours, when that is set.
+heads_up:
+  enabled: true
+  minutes_before: 10

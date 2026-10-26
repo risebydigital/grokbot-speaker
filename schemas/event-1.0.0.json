@@ -15,7 +15,8 @@
       "sync.completed", "audio.device_lost",
       "bridge.sent", "bridge.answered", "bridge.timeout", "bridge.error",
       "bridge.spoken", "bridge.delivery_failed", "bridge.timeout_spoken",
-      "bridge.late_delivered", "bridge.deferred", "bridge.nudged"
+      "bridge.late_delivered", "bridge.deferred", "bridge.nudged",
+      "heads_up.scheduled", "heads_up.spoken"
     ]},
     "ts": {"type": "string", "format": "date-time"},
     "mono_ms": {"type": "integer", "minimum": 0},

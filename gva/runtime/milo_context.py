@@ -29,36 +29,54 @@ def waiting_items(cfg: Config, http: Any, *, now: datetime | None = None) -> lis
     """Clean items from the latest digest for this device, or an empty list."""
     if not cfg.bot_bridge.chat_while_waiting:
         return []
+    status, items = load_digest(cfg, http, now=now)
+    if status != "fresh":
+        return []
+    return items
+
+
+def load_digest(cfg: Config, http: Any, *, now: datetime | None = None) -> tuple[str, list[dict[str, str]]]:
+    """The latest digest, without the chat-while-waiting gate.
+
+    Status is ``fresh``, ``empty``, ``stale``, or ``unavailable``. A failed
+    read is unavailable and is not cached, so a blip does not wipe a schedule.
+    """
     moment = now or datetime.now(timezone.utc)
     cached = _read_cache(cfg, moment)
-    if cached is not _UNSET:
-        return _fresh_items(cached if isinstance(cached, dict) else None, cfg, moment)
-    row = _fetch(cfg, http)
-    _write_cache(cfg, row)
-    return _fresh_items(row, cfg, moment)
+    if cached is _UNSET:
+        status, row = _fetch_row(cfg, http)
+        if status == "unavailable":
+            return "unavailable", []
+        _write_cache(cfg, row)
+    else:
+        row = cached if isinstance(cached, dict) else None
+    return _classify(row, cfg, moment)
 
 
-def _fresh_items(row: dict[str, Any] | None, cfg: Config, now: datetime) -> list[dict[str, str]]:
+def _classify(row: dict[str, Any] | None, cfg: Config, now: datetime) -> tuple[str, list[dict[str, str]]]:
     if not row:
-        return []
+        return "empty", []
     created = _parse_time(row.get("created_at"))
     if created is None:
-        return []
+        return "empty", []
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     age = (now - created).total_seconds()
     if age > float(cfg.bot_bridge.context_max_age_s):
-        return []
-    return _clean_items(row.get("items"))
+        return "stale", []
+    return "fresh", _clean_items(row.get("items"))
 
 
-def _fetch(cfg: Config, http: Any) -> dict[str, Any] | None:
+def _fetch_row(cfg: Config, http: Any) -> tuple[str, dict[str, Any] | None]:
+    """``ok`` with a row or None, ``empty`` when the table has no digest, ``unavailable`` on a blip."""
     table = str(cfg.bot_bridge.context_table or "").strip()
     device = str(cfg.device.id or "").strip()
     url = env_value("SUPABASE_URL")
     key = env_value("SUPABASE_SERVICE_KEY")
     if http is None or not url or not key or _TABLE_NAME.fullmatch(table) is None:
-        return None
+        return "unavailable", None
     if _DEVICE_ID.fullmatch(device) is None:
-        return None
+        return "unavailable", None
     endpoint = url.rstrip("/") + f"/rest/v1/{table}"
     try:
         response = http.get(
@@ -73,19 +91,19 @@ def _fetch(cfg: Config, http: Any) -> dict[str, Any] | None:
             timeout=5.0,
         )
     except Exception:
-        return None
+        return "unavailable", None
     code = int(getattr(response, "status_code", 0) or 0)
     if code != 200:
-        # 404 (table not created yet) and any other status: no suggestions.
-        return None
+        # 404 (table not created yet) and any other status: no digest.
+        return "empty", None
     try:
         payload = response.json()
     except Exception:
-        return None
+        return "empty", None
     if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
-        return None
+        return "empty", None
     row = payload[0]
-    return {"created_at": row.get("created_at"), "items": row.get("items")}
+    return "ok", {"created_at": row.get("created_at"), "items": row.get("items")}
 
 
 def _clean_items(raw: Any) -> list[dict[str, str]]:

@@ -807,7 +807,19 @@ def _safe(text: str) -> str:
 
 
 class RealtimeAssistant:
-    def __init__(self, cfg: Config, store: Store, events: EventLog, capture, sink, wake, tools, connector=None, bridge=None):
+    def __init__(
+        self,
+        cfg: Config,
+        store: Store,
+        events: EventLog,
+        capture,
+        sink,
+        wake,
+        tools,
+        connector=None,
+        bridge=None,
+        heads=None,
+    ):
         self.cfg = cfg
         self.store = store
         self.events = events
@@ -821,13 +833,18 @@ class RealtimeAssistant:
         self._follow_up = threading.Event()
         self._silence_override_s: float | None = None
         self._session_silence_s: float | None = None
+        self.heads = heads
         if bridge is not None:
             bridge.on_follow_up = self._follow_up.set
+        if heads is not None:
+            heads.on_follow_up = self._follow_up.set
         self.shutdown = __import__("threading").Event()
         self._last_heartbeat = time.monotonic()
         self.sessions = 0
 
     def run(self, max_sessions: int | None = None) -> None:
+        if self.heads is not None:
+            self.heads.start()
         self.capture.start()
         self.events.emit(
             "app.started",
@@ -864,6 +881,8 @@ class RealtimeAssistant:
                 if max_sessions is not None and self.sessions >= max_sessions:
                     break
         finally:
+            if self.heads is not None:
+                self.heads.stop()
             self.events.emit("app.stopped")
             self.capture.stop()
             close = getattr(self.sink, "close", None)
@@ -931,6 +950,8 @@ class RealtimeAssistant:
         if self.bridge is not None:
             self.bridge.attach(protocol)
             self.bridge.recall(deliver=True)
+        if self.heads is not None:
+            self.heads.attach(protocol)
         try:
             aec = None
             if self.cfg.audio.aec_enabled:
@@ -947,6 +968,8 @@ class RealtimeAssistant:
         finally:
             self._session_silence_s = None
             protocol.close = True
+            if self.heads is not None:
+                self.heads.detach()
             if self.bridge is not None:
                 # Speak outside this event loop so a closed session can open a short one.
                 self._bridge_leftover = self.bridge.take_unsent(protocol)
