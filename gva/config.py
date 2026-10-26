@@ -265,6 +265,8 @@ class BotBridgeConfig(BaseModel):
     context_max_age_s: int = Field(default=21600, ge=60, le=604800)
     # Offer digest items while waiting. Separate from chat_while_waiting.
     suggest_pending_items: bool = True
+    # How many digest titles Milo may mention in that one sentence.
+    max_suggestions: int = Field(default=4, ge=1, le=8)
     # "HH:MM-HH:MM" in the device timezone. "none" is off. A window may wrap midnight.
     nudge_quiet_hours: str = "none"
     # Mic stays open this long after an unsolicited nudge, for "thanks" or a new question.
@@ -554,6 +556,7 @@ CHANGE_RULES = {
     "privacy.redact_short_numbers": _as_bool,
     "privacy.sync_redact_short_numbers": _as_bool,
     "action.health_check": _as_bool,
+    "bot_bridge.max_suggestions": _number(int, 1, 8),
 }
 
 

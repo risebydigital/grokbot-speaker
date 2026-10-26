@@ -22,7 +22,13 @@ _DEVICE_ID = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 _KINDS = {"task", "report", "meeting", "other"}
 _CACHE_S = 60
 _ITEM_LIMIT = 8
+_DETAILS_LIMIT = 800
+_OWNER_LIMIT = 80
+_STATUS_LIMIT = 40
+_LINK_LIMIT = 300
+_URL = re.compile(r"https?://\S+", re.IGNORECASE)
 _UNSET = object()
+_ORDINALS = ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth")
 
 
 def waiting_items(cfg: Config, http: Any, *, now: datetime | None = None) -> list[dict[str, str]]:
@@ -41,30 +47,40 @@ def load_digest(cfg: Config, http: Any, *, now: datetime | None = None) -> tuple
     Status is ``fresh``, ``empty``, ``stale``, or ``unavailable``. A failed
     read is unavailable and is not cached, so a blip does not wipe a schedule.
     """
+    status, items, _created = load_digest_row(cfg, http, now=now)
+    return status, items
+
+
+def load_digest_row(
+    cfg: Config, http: Any, *, now: datetime | None = None
+) -> tuple[str, list[dict[str, str]], datetime | None]:
+    """Same as ``load_digest``, plus the row time used for "as of"."""
     moment = now or datetime.now(timezone.utc)
     cached = _read_cache(cfg, moment)
     if cached is _UNSET:
         status, row = _fetch_row(cfg, http)
         if status == "unavailable":
-            return "unavailable", []
+            return "unavailable", [], None
         _write_cache(cfg, row)
     else:
         row = cached if isinstance(cached, dict) else None
     return _classify(row, cfg, moment)
 
 
-def _classify(row: dict[str, Any] | None, cfg: Config, now: datetime) -> tuple[str, list[dict[str, str]]]:
+def _classify(
+    row: dict[str, Any] | None, cfg: Config, now: datetime
+) -> tuple[str, list[dict[str, str]], datetime | None]:
     if not row:
-        return "empty", []
+        return "empty", [], None
     created = _parse_time(row.get("created_at"))
     if created is None:
-        return "empty", []
+        return "empty", [], None
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     age = (now - created).total_seconds()
     if age > float(cfg.bot_bridge.context_max_age_s):
-        return "stale", []
-    return "fresh", _clean_items(row.get("items"))
+        return "stale", [], created
+    return "fresh", _clean_items(row.get("items")), created
 
 
 def _fetch_row(cfg: Config, http: Any) -> tuple[str, dict[str, Any] | None]:
@@ -133,8 +149,153 @@ def _clean_items(raw: Any) -> list[dict[str, str]]:
         note = entry.get("note")
         if isinstance(note, str) and note.strip():
             cleaned["note"] = " ".join(note.split())[:160]
+        details = _plain(entry.get("details"), _DETAILS_LIMIT)
+        if details:
+            cleaned["details"] = details
+        owner = _plain(entry.get("owner"), _OWNER_LIMIT)
+        if owner:
+            cleaned["owner"] = owner
+        status = _plain(entry.get("status"), _STATUS_LIMIT)
+        if status:
+            cleaned["status"] = status
+        link = _https_link(entry.get("link"))
+        if link:
+            cleaned["link"] = link
         items.append(cleaned)
     return items
+
+
+def offer_items(items: list[dict[str, Any]], limit: int) -> list[dict[str, str]]:
+    """Titles only. Details stay out of the offer the model hears first."""
+    cap = max(0, int(limit))
+    offered: list[dict[str, str]] = []
+    for item in items:
+        if len(offered) >= cap:
+            break
+        title = " ".join(str(item.get("title") or "").split())
+        if not title:
+            continue
+        kind = str(item.get("kind") or "other").strip().lower()
+        if kind not in _KINDS:
+            kind = "other"
+        offered.append({"kind": kind, "title": title})
+    return offered
+
+
+def match_item(items: list[dict[str, Any]], query: str) -> dict[str, Any] | None:
+    """The digest row whose title the question is about, if one matches."""
+    folded = " ".join((query or "").casefold().split())
+    if not folded:
+        return None
+    best: dict[str, Any] | None = None
+    best_len = 0
+    for item in items:
+        title = " ".join(str(item.get("title") or "").split())
+        key = title.casefold()
+        if not key:
+            continue
+        if key in folded or folded in key:
+            if len(key) > best_len:
+                best = item
+                best_len = len(key)
+    return best
+
+
+def title_mentioned(question: str, titles: list[str]) -> str:
+    """Longest digest title named in the question, or an empty string."""
+    folded = " ".join((question or "").casefold().split())
+    if not folded:
+        return ""
+    found = [title.strip() for title in titles if title and title.casefold().strip() in folded]
+    if not found:
+        return ""
+    return max(found, key=len)
+
+
+def spoken_update(item: dict[str, Any], created: datetime | None, zone_name: str) -> str | None:
+    """One sentence from the pre-fetched update. The link is never included."""
+    details = _without_urls(str(item.get("details") or ""))
+    details = " ".join(details.split())
+    if not details:
+        return None
+    if details[-1] not in ".!?":
+        details += "."
+    if len(details) > 1 and details[0].isupper() and not details[1].isupper():
+        details = details[0].lower() + details[1:]
+    extras: list[str] = []
+    blob = details.casefold()
+    status = " ".join(str(item.get("status") or "").split())
+    owner = " ".join(str(item.get("owner") or "").split())
+    if status and status.casefold() not in blob:
+        extras.append(f"The status is {status}.")
+    if owner and owner.casefold() not in blob:
+        extras.append(f"{owner} owns it.")
+    tail = (" " + " ".join(extras)) if extras else ""
+    line = f"As of {update_phrase(created, zone_name)}, {details}{tail}"
+    line = " ".join(_without_urls(line).split())
+    link = str(item.get("link") or "")
+    if link and link in line:
+        line = " ".join(line.replace(link, " ").split())
+    return line or None
+
+
+def update_phrase(created: datetime | None, zone_name: str) -> str:
+    """How Milo attributes the digest. Brenda posts it."""
+    if created is None:
+        return "the latest update"
+    try:
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo(zone_name or "Europe/London")
+    except Exception:
+        zone = timezone.utc
+    local = created.astimezone(zone)
+    return f"Brenda's {_spoken_clock(local)} update"
+
+
+def ordinal_word(index: int) -> str:
+    if 0 <= index < len(_ORDINALS):
+        return _ORDINALS[index]
+    return "next"
+
+
+def labelled_line(base: str, *, label: str, ordinal: int, concurrent: bool) -> str:
+    """Point a team answer at the question it belongs to."""
+    if label:
+        return f"On {label}: {base}"
+    if concurrent:
+        return f"On your {ordinal_word(ordinal)} question: {base}"
+    return base
+
+
+def _plain(value: Any, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.replace("\x00", " ").split())
+    return text[:limit]
+
+
+def _https_link(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = "".join(value.split())
+    if not text.lower().startswith("https://") or len(text) > _LINK_LIMIT:
+        return ""
+    if any(mark in text for mark in " <>\"'"):
+        return ""
+    return text
+
+
+def _without_urls(text: str) -> str:
+    return _URL.sub(" ", text)
+
+
+def _spoken_clock(local: datetime) -> str:
+    hour = local.hour % 12 or 12
+    suffix = "am" if local.hour < 12 else "pm"
+    if local.minute == 0:
+        return f"{hour}{suffix}"
+    return f"{hour}:{local.minute:02d}{suffix}"
 
 
 def _parse_time(value: Any) -> datetime | None:

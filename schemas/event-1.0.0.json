@@ -14,7 +14,7 @@
       "config.changed", "budget.threshold", "budget.degraded", "eval.case", "eval.summary",
       "sync.completed", "audio.device_lost",
       "bridge.sent", "bridge.answered", "bridge.timeout", "bridge.error",
-      "bridge.spoken", "bridge.delivery_failed", "bridge.timeout_spoken",
+      "bridge.queued", "bridge.spoken", "bridge.delivery_failed", "bridge.timeout_spoken",
       "bridge.late_delivered", "bridge.deferred", "bridge.nudged",
       "heads_up.scheduled", "heads_up.spoken"
     ]},
@@ -44,6 +44,10 @@
      "then": {"$ref": "#/$defs/stt_completed"}},
     {"if": {"properties": {"type": {"const": "bridge.answered"}}, "required": ["type"]},
      "then": {"required": ["latency_ms"], "properties": {"latency_ms": {"type": "integer", "minimum": 0}}}},
+    {"if": {"properties": {"type": {"const": "bridge.queued"}}, "required": ["type"]},
+     "then": {"required": ["wait_ms"], "properties": {"wait_ms": {"type": "integer", "minimum": 0}}}},
+    {"if": {"properties": {"type": {"const": "bridge.spoken"}}, "required": ["type"]},
+     "then": {"properties": {"wait_ms": {"type": "integer", "minimum": 0}}}},
     {"if": {"properties": {"type": {"const": "bridge.delivery_failed"}}, "required": ["type"]},
      "then": {"required": ["reason"], "properties": {"reason": {"type": "string", "minLength": 1, "maxLength": 80}}}}
   ],
