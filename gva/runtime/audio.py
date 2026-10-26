@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import queue
 import threading
 import time
 from collections import deque
@@ -18,6 +17,30 @@ FALLBACK_PHRASE = "Sorry, I couldn't get that. My calendar and reports aren't co
 
 def chunk_samples(sample_rate: int, chunk_ms: int) -> int:
     return int(sample_rate * chunk_ms / 1000)
+
+
+def scale_blocksize(frames_at_48k: int, device_rate: int) -> int:
+    """Period size. ``frames_at_48k`` of 2400 is 50 ms, scaled to the opened rate."""
+    rate = max(1, int(device_rate))
+    frames = int(round(int(frames_at_48k) * rate / 48000))
+    return max(256, frames)
+
+
+def capture_period(chunk_ms: int, frames_at_48k: int, device_rate: int) -> int:
+    """Capture period. At least one wake chunk, and at least the output period."""
+    rate = max(1, int(device_rate))
+    chunk = max(1, int(rate * max(1, int(chunk_ms)) / 1000))
+    return max(chunk, scale_blocksize(frames_at_48k, rate))
+
+
+def coerce_latency(value) -> float | str:
+    """PortAudio latency: seconds, or the names 'high' and 'low'."""
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"high", "low"}:
+            return text
+        return float(text)
+    return float(value)
 
 
 def chunk_bytes(sample_rate: int, chunk_ms: int) -> int:
@@ -231,16 +254,23 @@ def probe_input(device: int | None, source_rate: int) -> tuple[int, int]:
 
 
 class JitterBuffer:
-    """Holds PCM until a short pre-buffer is full, then plays it as one stream.
+    """Preallocated ring the output callback copies from.
 
-    Calling sounddevice.play for every realtime audio delta restarts the device
-    and sounds chopped. This buffer is what the output callback reads instead.
+    Playback resampling happens before `push`, on the writer thread. `pull_into`
+    only copies into the array PortAudio already owns. Silence before the
+    pre-buffer fills is not an underrun. Once the buffer has drained, further
+    idle callbacks stay silent and are not counted again. A true gap refills
+    the pre-buffer before sound resumes.
     """
 
     def __init__(self, prebuffer_frames: int = 0, channels: int = 1):
         self.prebuffer_frames = max(0, int(prebuffer_frames))
         self.channels = max(1, int(channels))
-        self._samples = np.zeros((0, self.channels), dtype=np.int16)
+        # A few seconds, so a catch-up after a late callback does not allocate.
+        self._capacity = max(self.prebuffer_frames * 4, 48000 * 3, 8192)
+        self._storage = np.zeros((self._capacity, self.channels), dtype=np.int16)
+        self._read = 0
+        self._size = 0
         self._primed = self.prebuffer_frames == 0
         self._fed = False
         self.underruns = 0
@@ -250,31 +280,35 @@ class JitterBuffer:
         """Push interleaved device-format PCM. `channels` matches the open stream."""
         if len(pcm) < 2:
             return
-        flat = np.frombuffer(pcm, dtype=np.int16).copy()
+        flat = np.frombuffer(pcm, dtype=np.int16)
         usable = (flat.size // self.channels) * self.channels
         if usable < self.channels:
             return
         frames = flat[:usable].reshape(-1, self.channels)
         with self._lock:
-            self._samples = np.concatenate([self._samples, frames], axis=0)
+            self._write_frames(frames)
             self._fed = True
 
     def pull(self, frames: int) -> np.ndarray:
-        """Return shape (frames, channels). Shortfalls are silence, not a stream restart.
+        """Return shape (frames, channels). The callback uses `pull_into` instead."""
+        out = np.zeros((int(frames), self.channels), dtype=np.int16)
+        self.pull_into(out)
+        return out
 
-        Silence before the pre-buffer fills is not an underrun. Once the buffer
-        has drained, further idle callbacks stay silent and are not counted again.
-        """
-        out = np.zeros((frames, self.channels), dtype=np.int16)
+    def pull_into(self, out: np.ndarray) -> None:
+        """Copy the next frames into `out`. No new sample storage."""
+        frames = int(out.shape[0])
         with self._lock:
             if not self._primed:
-                if len(self._samples) < self.prebuffer_frames:
-                    return out
+                if self._size < self.prebuffer_frames:
+                    out.fill(0)
+                    return
                 self._primed = True
-            take = min(frames, len(self._samples))
+            take = min(frames, self._size)
             if take:
-                out[:take] = self._samples[:take]
-                self._samples = self._samples[take:]
+                self._read_into(out[:take])
+            if take < frames:
+                out[take:].fill(0)
             if take < frames and self._fed:
                 # A short final block is the tail of the reply. Counting that and
                 # the idle callback after it reported two underruns on every turn.
@@ -285,17 +319,46 @@ class JitterBuffer:
                     self.underruns += 1
                     self._primed = self.prebuffer_frames == 0
                 self._fed = False
-        return out
 
     def clear(self) -> None:
         with self._lock:
-            self._samples = np.zeros((0, self.channels), dtype=np.int16)
+            self._read = 0
+            self._size = 0
             self._primed = self.prebuffer_frames == 0
             self._fed = False
 
     def buffered(self) -> int:
         with self._lock:
-            return int(len(self._samples))
+            return int(self._size)
+
+    def _write_frames(self, frames: np.ndarray) -> None:
+        count = int(frames.shape[0])
+        if count <= 0:
+            return
+        if count >= self._capacity:
+            frames = frames[-self._capacity :]
+            count = self._capacity
+            self._read = 0
+            self._size = 0
+        overflow = self._size + count - self._capacity
+        if overflow > 0:
+            self._read = (self._read + overflow) % self._capacity
+            self._size -= overflow
+        write_at = (self._read + self._size) % self._capacity
+        first = min(count, self._capacity - write_at)
+        self._storage[write_at : write_at + first] = frames[:first]
+        if count > first:
+            self._storage[: count - first] = frames[first:]
+        self._size += count
+
+    def _read_into(self, out: np.ndarray) -> None:
+        count = int(out.shape[0])
+        first = min(count, self._capacity - self._read)
+        out[:first] = self._storage[self._read : self._read + first]
+        if count > first:
+            out[first:] = self._storage[: count - first]
+        self._read = (self._read + count) % self._capacity
+        self._size -= count
 
 
 def list_devices() -> list[dict[str, Any]]:
@@ -374,6 +437,87 @@ def resolve_device(substring: str, kind: str) -> int | None:
     return None
 
 
+class CaptureRing:
+    """Fixed mono storage. The capture callback copies in. `read` resamples later."""
+
+    def __init__(self, capacity: int):
+        self.capacity = max(1024, int(capacity))
+        self.storage = np.zeros(self.capacity, dtype=np.int16)
+        self._acc = np.zeros(4096, dtype=np.int32)
+        self._mono = np.zeros(4096, dtype=np.int16)
+        self.read_at = 0
+        self.size = 0
+
+    def prepare_scratch(self, frames: int) -> None:
+        frames = max(1, int(frames))
+        if self._acc.size < frames:
+            self._acc = np.zeros(frames, dtype=np.int32)
+            self._mono = np.zeros(frames, dtype=np.int16)
+
+    def clear(self) -> None:
+        self.read_at = 0
+        self.size = 0
+
+    def write_bytes(self, pcm: bytes) -> None:
+        if len(pcm) < 2:
+            return
+        self._write_flat(np.frombuffer(pcm, dtype=np.int16))
+
+    def write_input(self, indata, frames: int) -> None:
+        audio = np.asarray(indata)
+        count = int(frames or 0)
+        if count <= 0 or audio.size == 0:
+            return
+        if audio.ndim == 2 and audio.shape[1] > 1:
+            if count > self._acc.size:
+                self._acc = np.zeros(count, dtype=np.int32)
+            acc = self._acc[:count]
+            acc[:] = audio[:count, 0]
+            channels = int(audio.shape[1])
+            for channel in range(1, channels):
+                acc += audio[:count, channel]
+            acc //= channels
+            mono = self._mono[:count]
+            mono[:] = acc
+            self._write_flat(mono)
+            return
+        flat = np.asarray(audio, dtype=np.int16).reshape(-1)
+        self._write_flat(flat[:count])
+
+    def take(self, max_frames: int) -> bytes:
+        if self.size <= 0:
+            return b""
+        count = self.size if max_frames <= 0 else min(self.size, int(max_frames))
+        out = np.empty(count, dtype=np.int16)
+        first = min(count, self.capacity - self.read_at)
+        out[:first] = self.storage[self.read_at : self.read_at + first]
+        if count > first:
+            out[first:] = self.storage[: count - first]
+        self.read_at = (self.read_at + count) % self.capacity
+        self.size -= count
+        return out.tobytes()
+
+    def _write_flat(self, samples: np.ndarray) -> None:
+        count = int(samples.size)
+        if count <= 0:
+            return
+        if count >= self.capacity:
+            samples = samples[-self.capacity :]
+            count = self.capacity
+            self.read_at = 0
+            self.size = 0
+        overflow = self.size + count - self.capacity
+        if overflow > 0:
+            self.read_at = (self.read_at + overflow) % self.capacity
+            self.size -= overflow
+        write_at = (self.read_at + self.size) % self.capacity
+        first = min(count, self.capacity - write_at)
+        self.storage[write_at : write_at + first] = samples[:first]
+        if count > first:
+            self.storage[: count - first] = samples[first:]
+        self.size += count
+
+
 class SoundDeviceCapture:
     """Capture callback plus a supervisor that reopens the device after an error or EOF.
 
@@ -385,20 +529,35 @@ class SoundDeviceCapture:
     callback is stuck.
     """
 
-    def __init__(self, device: int | None, sample_rate: int, chunk_ms: int, on_lost=None, on_error=None):
+    def __init__(
+        self,
+        device: int | None,
+        sample_rate: int,
+        chunk_ms: int,
+        on_lost=None,
+        on_error=None,
+        latency: float | str = 0.2,
+        blocksize: int = 2400,
+    ):
         self.device = device
         self.sample_rate = sample_rate
         self.chunk_ms = chunk_ms
         self.on_lost = on_lost
         self.on_error = on_error
+        self.latency = coerce_latency(latency)
+        self.blocksize_at_48k = int(blocksize)
+        self.blocksize = capture_period(chunk_ms, self.blocksize_at_48k, sample_rate)
         self.device_rate = sample_rate
         self.device_channels = 1
         now = time.monotonic()
         self.last_audio_at = now
         self._opened_at = now
         self.reopen_delay = 0.5
-        self._lock = threading.Lock()
-        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=32)
+        self._cv = threading.Condition()
+        # Two seconds at 48 kHz. Resized once the device rate is known.
+        self._ring = CaptureRing(48000 * 2)
+        self._period = 0
+        self._hw_overflows = 0
         self._stream = None
         self._running = False
         self._stopped = threading.Event()
@@ -415,9 +574,8 @@ class SoundDeviceCapture:
         return self._running
 
     def queued(self) -> int:
-        with self._lock:
-            q = self._queue
-        return int(q.qsize())
+        with self._cv:
+            return int(self._ring.size)
 
     def start(self) -> None:
         self._stopped.clear()
@@ -433,13 +591,19 @@ class SoundDeviceCapture:
 
         self.device_rate, self.device_channels = probe_input(self.device, self.sample_rate)
         self._resampler = StreamingResampler(self.device_rate, self.sample_rate)
-        block = chunk_samples(self.device_rate, self.chunk_ms)
+        block = capture_period(self.chunk_ms, self.blocksize_at_48k, self.device_rate)
+        self.blocksize = block
+        self._period = block
+        with self._cv:
+            self._ring = CaptureRing(max(block * 32, self.device_rate * 2))
+            self._ring.prepare_scratch(block)
         self._stream = sd.InputStream(
             device=self.device,
             channels=self.device_channels,
             samplerate=self.device_rate,
             dtype="int16",
             blocksize=block,
+            latency=self.latency,
             callback=self._on_audio,
         )
         self._stream.start()
@@ -465,11 +629,10 @@ class SoundDeviceCapture:
                 # else means the device is gone.
                 if "overflow" not in text.casefold():
                     self._halt(RuntimeError(text or "capture device error"))
-            pcm = _downmix_int16(indata)
-            if not pcm:
-                self._halt(EOFError("capture stream ended"))
+            with self._cv:
+                self._ring.write_input(indata, count)
+                self._cv.notify_all()
             self.last_audio_at = time.monotonic()
-            self._put(pcm)
         except Exception as exc:
             if exc.__class__.__name__ == "CallbackStop" or getattr(exc, "_capture_halt", False):
                 raise
@@ -502,26 +665,16 @@ class SoundDeviceCapture:
         self._failed.set()
 
     def _put(self, pcm: bytes) -> None:
-        with self._lock:
-            q = self._queue
-        try:
-            q.put_nowait(pcm)
-        except queue.Full:
-            try:
-                q.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                q.put_nowait(pcm)
-            except queue.Full:
-                pass
+        with self._cv:
+            self._ring.write_bytes(pcm)
+            self._cv.notify_all()
 
     def read(self, timeout: float = 0.2, nowait: bool = False) -> bytes | None:
-        with self._lock:
-            q = self._queue
-        try:
-            raw = q.get_nowait() if nowait else q.get(timeout=timeout)
-        except queue.Empty:
+        with self._cv:
+            if not nowait and self._ring.size <= 0:
+                self._cv.wait(timeout=timeout)
+            raw = self._ring.take(self._period)
+        if not raw:
             return b""
         return self._to_capture_rate(raw)
 
@@ -595,8 +748,27 @@ class SoundDeviceCapture:
 
     def flush(self) -> None:
         """Drop queued frames without spinning if the callback is still producing them."""
-        with self._lock:
-            self._queue = queue.Queue(maxsize=32)
+        with self._cv:
+            self._ring.clear()
+
+    def opened_stats(self) -> dict[str, Any]:
+        """Latency and period PortAudio actually opened. Empty if the stream is closed."""
+        stream = self._stream
+        if stream is None:
+            return {"opened": False}
+        rate = float(getattr(stream, "samplerate", 0) or self.device_rate or 0)
+        latency = float(getattr(stream, "latency", 0) or 0)
+        block = int(getattr(stream, "blocksize", 0) or self.blocksize or 0)
+        channels = int(getattr(stream, "channels", 0) or self.device_channels or 0)
+        return {
+            "opened": True,
+            "rate": int(round(rate)) if rate else 0,
+            "channels": channels,
+            "blocksize": block,
+            "latency_s": latency,
+            "buffer_frames": int(round(latency * rate)) if latency and rate else 0,
+            "buffer_ms": int(round(latency * 1000)),
+        }
 
     def stop(self) -> None:
         self._running = False
@@ -685,18 +857,24 @@ class SoundDeviceSink:
         device: int | None,
         sample_rate: int,
         prebuffer_ms: int = 250,
-        latency: str = "high",
+        latency: float | str = 0.2,
+        blocksize: int = 2400,
     ):
         self.device = device
         self.sample_rate = sample_rate
         self.device_rate = sample_rate
         self.channels = 1
         self.prebuffer_ms = int(prebuffer_ms)
-        self.latency = latency or "high"
+        # 0.2 s asks for about 200 ms of device buffer. The name "high" is not
+        # enough on the USB speaker: it still opened a 60 ms buffer.
+        self.latency = coerce_latency(0.2 if latency in ("", None) else latency)
+        self.blocksize_at_48k = int(blocksize)
+        self.blocksize = scale_blocksize(self.blocksize_at_48k, sample_rate)
         self.buffer = JitterBuffer(int(sample_rate * self.prebuffer_ms / 1000), channels=1)
         self._resampler = StreamingResampler(sample_rate, sample_rate)
         self._source_bytes = 0
         self._stopped = False
+        self._hw_underruns = 0
         self._stream = None
         self._format_ready = False
 
@@ -748,9 +926,30 @@ class SoundDeviceSink:
         return heard
 
     def consume_underruns(self) -> int:
-        count = int(self.buffer.underruns)
+        hardware = int(self._hw_underruns)
+        self._hw_underruns = 0
+        count = int(self.buffer.underruns) + hardware
         self.buffer.underruns = 0
         return count
+
+    def opened_stats(self) -> dict[str, Any]:
+        """Latency and period PortAudio actually opened, plus underruns not yet logged."""
+        stream = self._stream
+        rate = float(getattr(stream, "samplerate", 0) or self.device_rate or 0) if stream is not None else float(self.device_rate or 0)
+        latency = float(getattr(stream, "latency", 0) or 0) if stream is not None else 0.0
+        block = int(getattr(stream, "blocksize", 0) or self.blocksize or 0) if stream is not None else int(self.blocksize or 0)
+        channels = int(getattr(stream, "channels", 0) or self.channels or 0) if stream is not None else int(self.channels or 0)
+        return {
+            "opened": stream is not None,
+            "rate": int(round(rate)) if rate else 0,
+            "channels": channels,
+            "blocksize": block,
+            "latency_s": latency,
+            "buffer_frames": int(round(latency * rate)) if latency and rate else 0,
+            "buffer_ms": int(round(latency * 1000)),
+            "prebuffer_ms": int(self.prebuffer_ms),
+            "underruns": int(self.buffer.underruns) + int(self._hw_underruns),
+        }
 
     def queued_frames(self) -> int:
         """Frames still waiting in the jitter buffer. Playback is not finished while this is above zero."""
@@ -778,11 +977,14 @@ class SoundDeviceSink:
         import sounddevice as sd
 
         self.prepare()
-        # About 20 ms. latency='high' lets PortAudio pick a USB-friendly buffer.
-        block = max(256, int(self.device_rate * 0.02))
+        block = scale_blocksize(self.blocksize_at_48k, self.device_rate)
+        self.blocksize = block
 
         def callback(outdata, frames, time_info, status) -> None:
-            outdata[:] = self.buffer.pull(frames)
+            # Copy only. Resampling already happened in write(), off this thread.
+            if status and getattr(status, "output_underflow", False):
+                self._hw_underruns += 1
+            self.buffer.pull_into(outdata)
 
         self._stream = sd.OutputStream(
             device=self.device,
@@ -794,6 +996,104 @@ class SoundDeviceSink:
             callback=callback,
         )
         self._stream.start()
+
+
+def _public_error(exc: BaseException) -> str:
+    text = f"{exc.__class__.__name__}: {exc}"
+    if "Bearer" in text or "xai-" in text:
+        return exc.__class__.__name__
+    return text[:300]
+
+
+def probe_opened_streams(cfg) -> tuple[dict[str, Any], str, dict[str, Any], str]:
+    """Open the speaker and microphone long enough to read the buffer PortAudio chose."""
+    output: dict[str, Any] = {}
+    capture: dict[str, Any] = {}
+    output_error = ""
+    capture_error = ""
+    sink = SoundDeviceSink(
+        None,
+        cfg.conversation.realtime.sample_rate if cfg.conversation.engine == "realtime" else cfg.audio.sample_rate,
+        prebuffer_ms=cfg.audio.playback_prebuffer_ms,
+        latency=cfg.audio.output_latency,
+        blocksize=cfg.audio.output_blocksize,
+    )
+    try:
+        sink.device = prefer_output(list_devices(), cfg.audio.output_device)
+        sink.prepare()
+        sink._ensure()
+        output = sink.opened_stats()
+    except Exception as exc:
+        output_error = _public_error(exc)
+    finally:
+        sink.close()
+    mic = SoundDeviceCapture(
+        None,
+        cfg.audio.capture_rate if cfg.conversation.engine == "realtime" else cfg.audio.sample_rate,
+        cfg.audio.chunk_ms,
+        latency=cfg.audio.capture_latency,
+        blocksize=cfg.audio.capture_blocksize,
+    )
+    try:
+        mic.device = resolve_device(cfg.audio.input_device, "input")
+        mic.start()
+        capture = mic.opened_stats()
+    except Exception as exc:
+        capture_error = _public_error(exc)
+    finally:
+        mic.stop()
+    return output, output_error, capture, capture_error
+
+
+def render_audio_stats(
+    cfg,
+    output: dict[str, Any],
+    output_error: str,
+    capture: dict[str, Any],
+    capture_error: str,
+    underrun_events: int,
+    underrun_samples: int,
+) -> str:
+    """Plain-text report. Device names and buffer sizes only."""
+    lines = [
+        (
+            f"configured output latency {cfg.audio.output_latency} "
+            f"blocksize {cfg.audio.output_blocksize} at 48000 Hz "
+            f"prebuffer {cfg.audio.playback_prebuffer_ms} ms"
+        ),
+        (
+            f"configured capture latency {cfg.audio.capture_latency} "
+            f"blocksize {cfg.audio.capture_blocksize} at 48000 Hz "
+            f"chunk {cfg.audio.chunk_ms} ms"
+        ),
+    ]
+    lines.append(_stream_line("output", output, output_error))
+    lines.append(_stream_line("capture", capture, capture_error))
+    lines.append(f"playback.underrun events {int(underrun_events)}  underruns {int(underrun_samples)}")
+    return "\n".join(lines)
+
+
+def _stream_line(kind: str, stats: dict[str, Any], error: str) -> str:
+    if error:
+        return f"{kind}: not opened ({error})"
+    if not stats or not stats.get("opened"):
+        return f"{kind}: not opened"
+    period_ms = 0
+    rate = int(stats.get("rate") or 0)
+    block = int(stats.get("blocksize") or 0)
+    if rate and block:
+        period_ms = int(round(block / rate * 1000))
+    extra = ""
+    if kind == "output":
+        extra = f"  prebuffer {int(stats.get('prebuffer_ms') or 0)} ms"
+    return (
+        f"{kind}: {rate} Hz  {int(stats.get('channels') or 0)} ch  "
+        f"blocksize {block} ({period_ms} ms)  "
+        f"latency {float(stats.get('latency_s') or 0):.3f} s  "
+        f"buffer {int(stats.get('buffer_frames') or 0)} frames "
+        f"({int(stats.get('buffer_ms') or 0)} ms)"
+        + extra
+    )
 
 
 def fallback_wav_path() -> Path:

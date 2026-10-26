@@ -26,8 +26,16 @@ audio:
   # Queue this much device-rate audio before the callback leaves silence.
   # After an underrun the same cushion fills again before sound resumes.
   playback_prebuffer_ms: 250
-  # PortAudio latency hint for the USB speaker. high or low.
+  # Older hint. The stream uses output_latency below. "high" on the USB2.0
+  # speaker still opened a 60 ms buffer (period 960, buffer 2880 at 48 kHz).
   playback_latency: high
+  # Seconds, or high/low. 0.2 asks PortAudio for about 200 ms of device buffer.
+  output_latency: 0.2
+  # Period in frames at 48 kHz. 2400 is 50 ms. Scaled when the device rate differs.
+  output_blocksize: 2400
+  # Microphone latency. The period is at least one wake chunk (chunk_ms).
+  capture_latency: 0.2
+  capture_blocksize: 2400
   # Meeting heads-up and nudge chime. 1 is full (peak 18000). 0 is silent.
   chime_volume: 1.0
 
