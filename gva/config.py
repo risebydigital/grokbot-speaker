@@ -38,6 +38,8 @@ class AudioConfig(BaseModel):
     playback_prebuffer_ms: int = 200
     # PortAudio hint. "high" suits the Sanyun USB card. "low" is the other allowed value.
     playback_latency: Literal["high", "low"] = "high"
+    # 1 is the approved chime at peak 18000. Loud enough for a room, and under clipping.
+    chime_volume: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 class WakeConfig(BaseModel):
@@ -557,6 +559,7 @@ CHANGE_RULES = {
     "privacy.sync_redact_short_numbers": _as_bool,
     "action.health_check": _as_bool,
     "bot_bridge.max_suggestions": _number(int, 1, 8),
+    "audio.chime_volume": _number(float, 0, 1),
 }
 
 

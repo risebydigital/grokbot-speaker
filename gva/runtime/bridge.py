@@ -1305,15 +1305,10 @@ class BotBridge:
         sink = self.sink
         if sink is None:
             return
-        from gva.runtime.audio import tone
+        from gva.runtime.chime import play_chime
 
         self.last_chime = "soft" if soft else "loud"
-        rate = int(getattr(sink, "sample_rate", 0) or self.pcm_rate or 24000)
-        if soft:
-            pcm = tone(50, 523, amp=1800, sample_rate=rate) + tone(70, 784, amp=1800, sample_rate=rate)
-        else:
-            pcm = tone(90, 880, amp=6000, sample_rate=rate) + tone(140, 1175, amp=6000, sample_rate=rate)
-        self._write_pcm(pcm, rate)
+        play_chime(sink, self.cfg)
 
     def _write_pcm(self, pcm: bytes, rate: int) -> None:
         sink = self.sink
