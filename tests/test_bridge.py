@@ -1,6 +1,7 @@
 """Bot bridge: webhook, PostgREST poll, and the realtime tool. No live network."""
 
 import json
+import time
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -11,6 +12,7 @@ from gva.config import Config, load_config, masked_secrets
 from gva.paths import project_root
 from gva.runtime.audio import FALLBACK_PHRASE, CollectingSink
 from gva.runtime.bridge import (
+    DEFER_LINE,
     STILL_CHECKING_LINE,
     TIMEOUT_LINE,
     WAITING_LINE,
@@ -18,6 +20,9 @@ from gva.runtime.bridge import (
     BotBridge,
     bridge_configured,
     bridge_status,
+    in_nudge_quiet_hours,
+    late_line,
+    nudge_line,
     probe_answers,
     supabase_doctor_line,
 )
@@ -149,10 +154,12 @@ def test_tool_is_hidden_until_the_bridge_is_configured(monkeypatch, tmp_path):
     tools = load_registry(cfg, store)
     assert "ask_rbd_team" not in tools.specs
     assert "check_team_answer" not in tools.specs
+    assert "defer_until_answer" not in tools.specs
     protocol = RealtimeProtocol(cfg, events, store, tools, CollectingSink())
     names = [item["name"] for item in protocol.session_update()["session"]["tools"]]
     assert "ask_rbd_team" not in names
     assert "check_team_answer" not in names
+    assert "defer_until_answer" not in names
     assert "not connected" in render_system(cfg).lower()
 
     _enable(monkeypatch)
@@ -160,6 +167,7 @@ def test_tool_is_hidden_until_the_bridge_is_configured(monkeypatch, tmp_path):
     assert bridge_configured(cfg) is False
     assert "ask_rbd_team" not in load_registry(cfg, store).specs
     assert "check_team_answer" not in load_registry(cfg, store).specs
+    assert "defer_until_answer" not in load_registry(cfg, store).specs
 
 
 def test_tool_is_advertised_when_configured(monkeypatch, tmp_path):
@@ -174,6 +182,7 @@ def test_tool_is_advertised_when_configured(monkeypatch, tmp_path):
     described = {item["name"]: item["description"] for item in protocol.session_update()["session"]["tools"]}
     assert "ask_rbd_team" in described
     assert "any answer yet" in described["check_team_answer"].lower()
+    assert "tell me later" in described["defer_until_answer"].lower()
     prompt = render_system(cfg)
     assert "ask_rbd_team" in prompt
     assert "call get_calendar_events" not in prompt
@@ -215,7 +224,10 @@ def test_webhook_posts_polls_and_marks_the_row_read(monkeypatch, tmp_path):
     assert http.patches[0]["json"]["read_at"].endswith("Z")
     assert http.patches[0]["params"]["request_id"] == "eq." + body["request_id"]
     assert http.patches[0]["headers"]["Prefer"] == "return=minimal"
-    assert spoken == [ANSWER]
+    assert spoken == ["bot's come back. " + ANSWER]
+    assert store.recent("bridge.spoken", 1)[0]["request_id"] == body["request_id"]
+    assert "bridge.spoken" not in UPLOAD_TYPES
+    assert "bridge.delivery_failed" not in UPLOAD_TYPES
     assert bridge.sink.chunks
     sent = store.recent("bridge.sent", 1)[0]
     assert sent["request_id"] == body["request_id"]
@@ -284,10 +296,18 @@ def test_timeout_says_the_team_did_not_reply(monkeypatch, tmp_path):
     _cfg, store, _events, bridge = _bridge(tmp_path, http, speaker=spoken.append, sink=sink)
     bridge.submit(QUESTION, background=False)
     assert spoken == [TIMEOUT_LINE]
+    assert "couldn't get an answer" in TIMEOUT_LINE
     assert sink.chunks == []
     assert store.recent("bridge.timeout", 1)[0]["level"] == "warning"
+    spoken_event = store.recent("bridge.timeout_spoken", 1)[0]
+    assert spoken_event["request_id"]
+    assert "bridge.timeout_spoken" not in UPLOAD_TYPES
     assert store.recent("bridge.answered", 1) == []
     assert http.patches == []
+    assert bridge._kept
+    pending = json.loads(bridge._pending_path().read_text(encoding="utf-8"))
+    assert pending["timed_out"]
+    assert QUESTION not in json.dumps(pending)
     _assert_clean(_logged(tmp_path, store))
 
 
@@ -329,8 +349,10 @@ def test_late_answer_is_kept_for_the_next_wake_or_a_later_ask(monkeypatch, tmp_p
     assert http.patches == []
     pending = json.loads(bridge._pending_path().read_text(encoding="utf-8"))
     assert pending["request_ids"]
+    assert pending["timed_out"]
     assert QUESTION not in json.dumps(pending)
     assert ANSWER not in json.dumps(pending)
+    assert store.recent("bridge.timeout_spoken", 1)
 
     http.rows = [{"answer": ANSWER, "answered_by": "Brenda", "read_at": None}]
     protocol = RealtimeProtocol(cfg, events, store, load_registry(cfg, store), CollectingSink())
@@ -338,10 +360,20 @@ def test_late_answer_is_kept_for_the_next_wake_or_a_later_ask(monkeypatch, tmp_p
     found = bridge.recall(deliver=True)
     assert found == [ANSWER]
     assert spoken == [TIMEOUT_LINE]
-    queued = protocol._bridge_items[0]["messages"][0]["item"]["content"][0]["text"]
-    assert queued == ANSWER
-    assert http.patches
+    queued = protocol._bridge_items[0]["text"]
+    assert queued == late_line(ANSWER, "Brenda")
+    assert queued.startswith("By the way, Brenda came back")
+    assert http.patches == []
     assert "Brenda" not in _logged(tmp_path, store)
+    protocol.close = True
+    bridge.detach(protocol)
+    assert spoken[-1] == queued
+    assert http.patches
+    late = store.recent("bridge.late_delivered", 1)[0]
+    assert late["request_id"]
+    assert ANSWER not in json.dumps(late)
+    assert "Brenda" not in json.dumps(late)
+    assert "bridge.late_delivered" not in UPLOAD_TYPES
     assert bridge.recall(deliver=True) == []
 
     tools = load_registry(cfg, store)
@@ -405,7 +437,9 @@ def test_answer_after_the_session_closed_chimes_and_speaks(monkeypatch, tmp_path
     protocol.close = True
     bridge.attach(protocol)
     bridge.submit(QUESTION, background=False)
-    assert spoken == [ANSWER]
+    assert spoken == ["bot's come back. " + ANSWER]
+    assert store.recent("bridge.spoken", 1)
+    assert ANSWER not in json.dumps(store.recent("bridge.spoken", 1)[0])
     assert sink.chunks
     assert protocol._bridge_items == []
     _assert_clean(_logged(tmp_path, store))
@@ -424,14 +458,163 @@ def test_open_session_queues_a_natural_readout_and_speaks_if_it_closes(monkeypat
     assert spoken == []
     assert sink.chunks == []
     queued = protocol._bridge_items[0]
-    assert queued["messages"][0]["item"]["content"][0]["text"] == ANSWER
+    assert queued["text"] == "The team's come back. " + ANSWER
+    assert queued["messages"][0]["item"]["content"][0]["text"] == queued["text"]
     instructions = queued["messages"][1]["response"]["instructions"]
-    assert "naturally and briefly" in instructions
+    assert "come back" in instructions
+    assert "response.create" in queued["messages"][1]["type"]
     protocol.close = True
     bridge.detach(protocol)
-    assert spoken == [ANSWER]
+    assert spoken == ["The team's come back. " + ANSWER]
+    assert store.recent("bridge.spoken", 1)
     assert sink.chunks
     assert protocol._bridge_items == []
+
+
+def test_answer_waits_until_playback_finishes(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    spoken = []
+    cfg, store, events, bridge = _bridge(tmp_path, http, speaker=spoken.append)
+    protocol = RealtimeProtocol(cfg, events, store, load_registry(cfg, store), CollectingSink())
+    protocol.speaking = True
+    bridge.attach(protocol)
+    bridge.submit(QUESTION, background=False)
+    assert spoken == []
+    assert protocol.pop_bridge_ready() is None
+    protocol.speaking = False
+    protocol.playback.put(b"\x01\x00")
+    assert protocol.pop_bridge_ready() is None
+    protocol.playback.get_nowait()
+    item = protocol.pop_bridge_ready()
+    assert item is not None
+    assert item["text"] == "Brenda's come back. " + ANSWER
+    assert item["messages"][1]["type"] == "response.create"
+    assert "Brenda's come back" in item["messages"][1]["response"]["instructions"]
+    assert store.recent("bridge.spoken", 1) == []
+    assert ANSWER not in _logged(tmp_path, store)
+
+
+def test_open_session_marks_spoken_only_after_audio(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    spoken = []
+    cfg, store, events, bridge = _bridge(tmp_path, http, speaker=spoken.append)
+    protocol = RealtimeProtocol(cfg, events, store, load_registry(cfg, store), CollectingSink())
+    bridge.attach(protocol)
+    bridge.submit(QUESTION, background=False)
+    item = protocol.pop_bridge_ready()
+    assert item["request_id"]
+    protocol.finish_bridge_send(True)
+    protocol.on_event({"type": "response.created", "response": {"id": "r-bridge"}})
+    protocol._response_pcm_bytes = 4800
+    protocol.on_event({"type": "response.done", "response": {"id": "r-bridge"}})
+    assert spoken == []
+    assert http.patches
+    spoken_event = store.recent("bridge.spoken", 1)[0]
+    assert spoken_event["request_id"] == item["request_id"]
+    assert ANSWER not in json.dumps(spoken_event)
+    assert "Brenda" not in json.dumps(spoken_event)
+
+
+def test_silent_readout_is_spoken_without_the_wake_word(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    spoken = []
+    cfg, store, events, bridge = _bridge(tmp_path, http, speaker=spoken.append)
+    protocol = RealtimeProtocol(cfg, events, store, load_registry(cfg, store), CollectingSink())
+    bridge.attach(protocol)
+    bridge.submit(QUESTION, background=False)
+    protocol.pop_bridge_ready()
+    protocol.finish_bridge_send(True)
+    protocol.on_event({"type": "response.created", "response": {"id": "r-bridge"}})
+    protocol.on_event({"type": "response.done", "response": {"id": "r-bridge"}})
+    assert spoken == ["Brenda's come back. " + ANSWER]
+    assert store.recent("bridge.spoken", 1)
+    assert store.recent("bridge.delivery_failed", 1) == []
+
+
+def test_failed_speech_is_kept_and_reported(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+
+    def fail(_text):
+        raise RuntimeError("alsa " + ANSWER)
+
+    cfg, store, events, bridge = _bridge(tmp_path, http, speaker=fail)
+    protocol = RealtimeProtocol(cfg, events, store, load_registry(cfg, store), CollectingSink())
+    protocol.close = True
+    bridge.attach(protocol)
+    bridge.submit(QUESTION, background=False)
+    failed = store.recent("bridge.delivery_failed", 1)[0]
+    assert failed["reason"] == "speak_failed"
+    assert ANSWER not in json.dumps(failed)
+    assert store.recent("bridge.spoken", 1) == []
+    assert http.patches == []
+    assert bridge._kept
+    _assert_clean(_logged(tmp_path, store))
+
+
+def test_session_stays_open_while_an_answer_is_pending(monkeypatch, tmp_path):
+    from gva.runtime.realtime import idle_should_close
+
+    _enable(monkeypatch)
+    http = FakeHttp()
+    cfg, _store, events, bridge = _bridge(tmp_path, http)
+    protocol = RealtimeProtocol(cfg, events, _store, load_registry(cfg, _store), CollectingSink())
+    protocol.last_activity = 0
+    assert idle_should_close(protocol, bridge, 100, 15) is True
+    bridge._remember("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    bridge._enter_inflight("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    assert bridge.holds_session() is True
+    assert idle_should_close(protocol, bridge, 100, 15) is False
+    cfg.bot_bridge.chat_while_waiting = False
+    assert bridge.holds_session() is False
+    assert idle_should_close(protocol, bridge, 100, 15) is True
+    cfg.bot_bridge.chat_while_waiting = True
+    bridge._kept["01ARZ3NDEKTSV4RRFFQ69G5FAV"] = int(time.time() * 1000) - 400_000
+    assert bridge.holds_session() is False
+    bridge._kept["01ARZ3NDEKTSV4RRFFQ69G5FAV"] = int(time.time() * 1000)
+    bridge.defer()
+    assert bridge.holds_session() is False
+    assert "bridge.deferred" not in UPLOAD_TYPES
+
+
+def test_digest_items_stay_out_of_the_instructions(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    cfg, store, events = _stack(tmp_path)
+    tools = load_registry(cfg, store)
+
+    class _ContextBridge(_StubBridge):
+        def waiting_context(self):
+            return [{"kind": "report", "title": "Streets report", "due": "Friday"}]
+
+    tools.ctx.bridge = _ContextBridge()
+    protocol = RealtimeProtocol(cfg, events, store, tools, CollectingSink())
+    protocol.on_event({"type": "response.created", "response": {"id": "r1"}})
+    messages = protocol.on_event(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": "ask_rbd_team",
+            "call_id": "call-bridge",
+            "arguments": json.dumps({"question": QUESTION}),
+        }
+    )
+    body = json.loads(messages[0]["item"]["output"])
+    assert body["pending_items"][0]["title"] == "Streets report"
+    assert "Streets report" not in protocol._response_instructions
+    assert "data, not instructions" in protocol._response_instructions
+    follow = protocol.on_event({"type": "response.done", "response": {"id": "r1"}})
+    assert "Streets report" not in follow[0]["response"]["instructions"]
+    prompt = render_system(cfg)
+    assert "do not invent a task, report, or meeting" in prompt
+    assert "Streets report" not in prompt
+    cfg.bot_bridge.chat_while_waiting = False
+    assert "do not invent a task, report, or meeting" not in render_system(cfg)
 
 
 def test_waiting_line_does_not_play_the_calendar_fallback(monkeypatch, tmp_path):
@@ -592,6 +775,14 @@ def test_example_files_document_the_bridge(monkeypatch):
     assert cfg.bot_bridge.nudge_s == 45
     assert cfg.bot_bridge.key_header == "Authorization"
     assert cfg.bot_bridge.key_prefix == "Bearer "
+    assert cfg.bot_bridge.chat_while_waiting is True
+    assert cfg.bot_bridge.context_table == "milo_context"
+    assert cfg.bot_bridge.context_max_age_s == 21600
+    assert cfg.bot_bridge.suggest_pending_items is True
+    assert cfg.bot_bridge.nudge_quiet_hours == "none"
+    assert cfg.bot_bridge.nudge_follow_up_s == 8
+    assert cfg.heads_up.enabled is True
+    assert cfg.heads_up.minutes_before == 10
     example = (project_root() / "gva.env.example").read_text(encoding="utf-8")
     assert "GVA_GROKBOT_WEBHOOK_URL=\n" in example
     assert "GVA_GROKBOT_WEBHOOK_KEY=\n" in example
@@ -604,6 +795,15 @@ def test_example_files_document_the_bridge(monkeypatch):
     assert "sb_secret_" in readme
     assert "apikey" in readme
     assert "supabase: OK" in readme
+    assert "milo_context" in readme
+    assert "chat_while_waiting" in readme
+    assert "suggest_pending_items" in readme
+    assert "nudge_quiet_hours" in readme
+    assert "heads_up.minutes_before" in readme
+    assert "heads_up.scheduled" in readme
+    assert "defer_until_answer" in readme
+    assert "I couldn't get an answer from the team this time" in readme
+    assert "By the way, Brenda came back" in readme
     assert "sb_secret_" in example
     assert "—" not in readme
     assert "–" not in readme
@@ -670,3 +870,329 @@ def test_bridge_cli(monkeypatch, tmp_path):
     assert SERVICE_KEY not in denied_text
     assert WEBHOOK_KEY not in denied_text
     assert not any(line.startswith("problem:") and "milo_bot_answers" in line for line in denied_text.splitlines())
+
+
+RID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+
+def _defer_on_send(bridge):
+    original = bridge._enter_inflight
+
+    def enter(request_id):
+        original(request_id)
+        bridge.defer()
+
+    bridge._enter_inflight = enter
+
+
+def test_suggestions_are_offered_once_and_a_decline_keeps_listening(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    cfg, store, events, bridge = _bridge(tmp_path, FakeHttp())
+    bridge.waiting_context = lambda: [
+        {"kind": "task", "title": "One"},
+        {"kind": "report", "title": "Two"},
+        {"kind": "meeting", "title": "Three"},
+        {"kind": "other", "title": "Four"},
+    ]
+    tools = load_registry(cfg, store)
+    tools.ctx.bridge = bridge
+    protocol = RealtimeProtocol(cfg, events, store, tools, CollectingSink())
+    assert [item["title"] for item in protocol._waiting_items()] == ["One", "Two"]
+    assert protocol._waiting_items() == []
+
+    cfg.bot_bridge.suggest_pending_items = False
+    bridge._suggestions_offered = False
+    assert protocol._waiting_items() == []
+    cfg.bot_bridge.suggest_pending_items = True
+    bridge._remember(RID)
+    bridge._enter_inflight(RID)
+    assert bridge.holds_session() is True
+    protocol.on_event({"type": "response.created", "response": {"id": "r-wait"}})
+    protocol.on_event(
+        {"type": "conversation.item.input_audio_transcription.completed", "transcript": "Not now."}
+    )
+    assert protocol.close is False
+    assert bridge._suggestions_declined is True
+    bridge._suggestions_offered = False
+    assert protocol._waiting_items() == []
+    protocol.on_event(
+        {"type": "conversation.item.input_audio_transcription.completed", "transcript": "stop"}
+    )
+    assert protocol.close is False
+    protocol.on_event(
+        {"type": "conversation.item.input_audio_transcription.completed", "transcript": "leave it"}
+    )
+    assert protocol.close is False
+    bridge._leave_inflight(RID)
+    protocol.on_event(
+        {"type": "conversation.item.input_audio_transcription.completed", "transcript": "stop"}
+    )
+    assert protocol.close is True
+
+
+def test_suggest_pending_items_false_offers_nothing(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    cfg, store, events, bridge = _bridge(tmp_path, FakeHttp())
+    cfg.bot_bridge.suggest_pending_items = False
+    bridge.waiting_context = lambda: [{"kind": "report", "title": "Streets report"}]
+    bridge._remember(RID)
+    bridge._enter_inflight(RID)
+    assert bridge.holds_session() is True
+    tools = load_registry(cfg, store)
+    tools.ctx.bridge = bridge
+    protocol = RealtimeProtocol(cfg, events, store, tools, CollectingSink())
+    assert protocol._waiting_items() == []
+    bridge.deliver = False
+    protocol.on_event({"type": "response.created", "response": {"id": "r1"}})
+    messages = protocol.on_event(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": "ask_rbd_team",
+            "call_id": "call-bridge",
+            "arguments": json.dumps({"question": QUESTION}),
+        }
+    )
+    body = json.loads(messages[0]["item"]["output"])
+    assert body == {"status": "sent"}
+    assert "Streets report" not in protocol._response_instructions
+    assert "Streets report" not in _logged(tmp_path, store)
+
+
+def test_defer_tool_confirms_once_then_closes_the_session(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    cfg, store, events, bridge = _bridge(tmp_path, FakeHttp())
+    bridge._remember(RID)
+    bridge._enter_inflight(RID)
+    tools = load_registry(cfg, store)
+    tools.ctx.bridge = bridge
+    protocol = RealtimeProtocol(cfg, events, store, tools, CollectingSink())
+    protocol.on_event({"type": "response.created", "response": {"id": "r1"}})
+    messages = protocol.on_event(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": "defer_until_answer",
+            "call_id": "call-defer",
+            "arguments": "{}",
+        }
+    )
+    assert json.loads(messages[0]["item"]["output"]) == {"status": "deferred"}
+    assert protocol.close is False
+    deferred = store.recent("bridge.deferred", 5)
+    assert [item["request_id"] for item in deferred] == [RID]
+    assert "bridge.deferred" not in UPLOAD_TYPES
+    follow = protocol.on_event({"type": "response.done", "response": {"id": "r1"}})
+    assert follow[0]["type"] == "response.create"
+    assert DEFER_LINE in follow[0]["response"]["instructions"]
+    assert protocol.close is False
+    protocol.on_event({"type": "response.created", "response": {"id": "r2"}})
+    protocol._response_pcm_bytes = 4800
+    protocol.on_event({"type": "response.done", "response": {"id": "r2"}})
+    assert protocol.close is True
+    assert bridge.defer()["status"] == "deferred"
+    assert len(store.recent("bridge.deferred", 5)) == 1
+    assert bridge.holds_session() is False
+    assert QUESTION not in _logged(tmp_path, store)
+
+
+def test_tell_me_later_defers_from_the_transcript(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    cfg, store, events, bridge = _bridge(tmp_path, FakeHttp())
+    bridge._remember(RID)
+    bridge._enter_inflight(RID)
+    tools = load_registry(cfg, store)
+    tools.ctx.bridge = bridge
+    protocol = RealtimeProtocol(cfg, events, store, tools, CollectingSink())
+    spoken = []
+    protocol.fallback_player = lambda _sink, _config, phrase: spoken.append(phrase) or 900
+    messages = protocol.on_event(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "Tell me later.",
+        }
+    )
+    assert messages == [
+        {"type": "response.create", "response": {"instructions": "Say only: " + DEFER_LINE}}
+    ]
+    assert protocol.close is False
+    protocol.on_event({"type": "response.created", "response": {"id": "r1"}})
+    tool_messages = protocol.on_event(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": "defer_until_answer",
+            "call_id": "call-defer",
+            "arguments": "{}",
+        }
+    )
+    assert tool_messages[0]["item"]["type"] == "function_call_output"
+    protocol._response_pcm_bytes = 4800
+    done = protocol.on_event({"type": "response.done", "response": {"id": "r1"}})
+    assert done == []
+    assert protocol.close is True
+    assert spoken == []
+    assert len(store.recent("bridge.deferred", 5)) == 1
+
+    fresh = RealtimeProtocol(cfg, events, store, tools, CollectingSink())
+    bridge._suggestions_declined = False
+    bridge._enter_inflight(RID)
+    fresh.on_event({"type": "response.created", "response": {"id": "r3"}})
+    cancelled = fresh.on_event(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "Nudge me when it's ready",
+        }
+    )
+    assert cancelled == [{"type": "response.cancel"}]
+    assert fresh.close is False
+    follow = fresh.on_event({"type": "response.done", "response": {"id": "r3"}})
+    assert DEFER_LINE in follow[0]["response"]["instructions"]
+    assert fresh.close is False
+
+
+def test_deferred_answer_soft_chimes_and_requests_a_follow_up(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    spoken = []
+    sink = CollectingSink()
+    _cfg, store, _events, bridge = _bridge(tmp_path, http, speaker=spoken.append, sink=sink)
+    _defer_on_send(bridge)
+    bridge.submit(QUESTION, background=False)
+    assert spoken == [nudge_line(ANSWER, "Brenda")]
+    assert bridge.last_chime == "soft"
+    assert sink.chunks
+    assert bridge.follow_ups == 1
+    assert http.patches
+    assert bridge._kept == {}
+    nudged = store.recent("bridge.nudged", 1)[0]
+    assert nudged["request_id"]
+    assert ANSWER not in json.dumps(nudged)
+    assert "Brenda" not in json.dumps(nudged)
+    assert "bridge.nudged" not in UPLOAD_TYPES
+    assert store.recent("bridge.deferred", 1)
+    _assert_clean(_logged(tmp_path, store))
+
+
+def test_quiet_hours_hold_the_nudge_until_an_explicit_release(monkeypatch, tmp_path):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    _enable(monkeypatch)
+    evening = datetime(2026, 10, 26, 23, 15, tzinfo=ZoneInfo("Europe/London"))
+    noon = evening.replace(hour=12)
+    assert in_nudge_quiet_hours("22:00-07:00", evening) is True
+    assert in_nudge_quiet_hours("22:00-07:00", noon) is False
+    assert in_nudge_quiet_hours("none", evening) is False
+    assert in_nudge_quiet_hours("", evening) is False
+    assert in_nudge_quiet_hours("off", evening) is False
+
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    spoken = []
+    cfg, store, events, bridge = _bridge(tmp_path, http, speaker=spoken.append)
+    cfg.bot_bridge.nudge_quiet_hours = "22:00-07:00"
+    bridge._now_fn = lambda: evening
+    _defer_on_send(bridge)
+    bridge.submit(QUESTION, background=False)
+    assert spoken == []
+    assert bridge.follow_ups == 0
+    assert store.recent("bridge.nudged", 1) == []
+    assert bridge.release_held_nudges() == 1
+    assert spoken == [nudge_line(ANSWER, "Brenda")]
+    assert bridge.last_chime == "soft"
+    assert bridge.follow_ups == 1
+    assert store.recent("bridge.nudged", 1)
+    assert bridge.release_held_nudges() == 0
+
+    held = FakeHttp()
+    held.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    spoken2 = []
+    cfg2, store2, events2, bridge2 = _bridge(tmp_path / "wake", held, speaker=spoken2.append)
+    cfg2.bot_bridge.nudge_quiet_hours = "22:00-07:00"
+    bridge2._now_fn = lambda: evening
+    _defer_on_send(bridge2)
+    bridge2.submit(QUESTION, background=False)
+    assert spoken2 == []
+    protocol = RealtimeProtocol(cfg2, events2, store2, load_registry(cfg2, store2), CollectingSink())
+    bridge2.attach(protocol)
+    assert spoken2 == []
+    assert protocol._bridge_items[0]["text"] == nudge_line(ANSWER, "Brenda")
+    assert protocol._bridge_items[0]["kind"] == "nudge_answer"
+    assert bridge2.follow_ups == 0
+    _assert_clean(_logged(tmp_path, store) + _logged(tmp_path / "wake", store2))
+
+
+def test_deferred_timeout_nudges_with_the_failure_line(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    monkeypatch.setattr("gva.runtime.bridge.LATE_NUDGE_CAP_S", 0)
+    http = FakeHttp()
+    spoken = []
+    _cfg, store, _events, bridge = _bridge(tmp_path, http, speaker=spoken.append)
+    _defer_on_send(bridge)
+    bridge.submit(QUESTION, background=False)
+    assert spoken == [TIMEOUT_LINE]
+    assert bridge.follow_ups == 0
+    assert bridge.last_chime == ""
+    assert http.patches == []
+    assert bridge._kept
+    assert store.recent("bridge.timeout", 1)
+    assert store.recent("bridge.timeout_spoken", 1) == []
+    nudged = store.recent("bridge.nudged", 1)[0]
+    assert nudged["request_id"]
+    assert ANSWER not in json.dumps(nudged)
+    _assert_clean(_logged(tmp_path, store))
+
+
+def test_deferred_late_answer_still_nudges(monkeypatch, tmp_path):
+    _enable(monkeypatch)
+    monkeypatch.setattr("gva.runtime.bridge.LATE_NUDGE_CAP_S", 30)
+    http = FakeHttp()
+    http.rows = [{"answer": ANSWER, "answered_by": "Brenda"}]
+    http.ready_after = 6
+    spoken = []
+    cfg, store, _events, bridge = _bridge(tmp_path, http, speaker=spoken.append)
+    cfg.bot_bridge.timeout_s = 9
+    cfg.bot_bridge.poll_s = 3
+    _defer_on_send(bridge)
+    bridge.submit(QUESTION, background=False)
+    assert spoken[0] == TIMEOUT_LINE
+    assert spoken[-1] == nudge_line(ANSWER, "Brenda")
+    assert bridge.follow_ups == 1
+    assert len(store.recent("bridge.nudged", 5)) == 2
+    assert http.patches
+    assert bridge._kept == {}
+    _assert_clean(_logged(tmp_path, store))
+
+
+def test_nudge_follow_up_skips_the_wake_word(monkeypatch, tmp_path):
+    import asyncio
+
+    from gva.runtime.realtime import RealtimeAssistant
+
+    _enable(monkeypatch)
+    cfg, store, events, bridge = _bridge(tmp_path, FakeHttp())
+
+    class _Capture:
+        def read(self, _timeout):
+            raise AssertionError("wake listen")
+
+    class _Socket:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    assistant = RealtimeAssistant(
+        cfg, store, events, _Capture(), CollectingSink(), None, None, bridge=bridge
+    )
+    bridge._request_follow_up()
+    assert assistant._wait_for_wake() is True
+    assert assistant._silence_override_s == 8
+
+    protocol = RealtimeProtocol(cfg, events, store, None, CollectingSink())
+    protocol.last_activity = 0
+    assistant._session_silence_s = 0.05
+    socket = _Socket()
+    asyncio.run(assistant._send_audio(socket, protocol, None))
+    assert protocol.close is True
+    assert socket.closed is True

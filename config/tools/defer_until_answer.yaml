@@ -1,0 +1,14 @@
+name: defer_until_answer
+description: >
+  Call this when a team answer is still pending and the caller wants to be
+  nudged later instead of waiting on the line. Use it for "nudge me when
+  it's ready", "let me know when you hear back", "tell me later", and
+  "I'll leave you to it". Say only the one short confirmation, then stop.
+  Do not keep chatting.
+timeout_s: 5
+risk: low
+personal_data: false
+parameters:
+  type: object
+  additionalProperties: false
+  properties: {}

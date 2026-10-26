@@ -392,10 +392,13 @@ def render_system(cfg: Config) -> str:
     now = datetime.now(zone)
     stamp = now.strftime("%A ") + f"{now.day} " + now.strftime("%B %Y, %H:%M")
     rendered = text.replace("{{now_local}}", stamp).replace("{{default_location}}", cfg.device.default_location)
-    from gva.runtime.bridge import CALENDAR_BULLET, WORK_BULLET, bridge_configured
+    from gva.runtime.bridge import CALENDAR_BULLET, WAITING_RULE, WORK_BULLET, bridge_configured
 
     if bridge_configured(cfg) and CALENDAR_BULLET in rendered:
-        rendered = rendered.replace(CALENDAR_BULLET, WORK_BULLET)
+        bullet = WORK_BULLET
+        if cfg.bot_bridge.chat_while_waiting:
+            bullet = bullet + "\n" + WAITING_RULE
+        rendered = rendered.replace(CALENDAR_BULLET, bullet)
     return rendered
 
 

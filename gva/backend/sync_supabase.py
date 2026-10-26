@@ -36,7 +36,7 @@ from gva.telemetry.rollups import rebuild
 from gva.telemetry.store import Store
 
 # Uploaded as rows. Everything else is acknowledged locally so it cannot clog the queue.
-# bridge.* stays in the local log. Those events have no voice-ops table.
+# bridge.* and heads_up.* stay in the local log. Those events have no voice-ops table.
 UPLOAD_TYPES = {
     "turn.completed",
     "llm.completed",

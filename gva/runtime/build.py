@@ -9,6 +9,7 @@ import httpx
 from gva.config import Config
 from gva.runtime.audio import SoundDeviceCapture, SoundDeviceSink, list_devices, prefer_output, resolve_device
 from gva.runtime.bridge import BotBridge, bridge_configured
+from gva.runtime.heads_up import MeetingHeadsUp
 from gva.runtime.grok_client import GrokClient
 from gva.runtime.pipeline import VoiceAssistant
 from gva.runtime.realtime import RealtimeAssistant
@@ -42,7 +43,8 @@ def build_realtime(cfg: Config) -> RealtimeAssistant:
     bridge = _bridge(cfg, events, sink, cfg.conversation.realtime.sample_rate)
     if bridge is not None:
         tools.ctx.bridge = bridge
-    return RealtimeAssistant(cfg, store, events, capture, sink, wake, tools, bridge=bridge)
+    heads = MeetingHeadsUp(cfg, events, sink=sink) if cfg.heads_up.enabled else None
+    return RealtimeAssistant(cfg, store, events, capture, sink, wake, tools, bridge=bridge, heads=heads)
 
 
 def build_local(cfg: Config) -> VoiceAssistant:

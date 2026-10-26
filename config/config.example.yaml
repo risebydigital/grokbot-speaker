@@ -222,3 +222,24 @@ bot_bridge:
   # Use key_prefix: "" when the panel sends the key with no prefix at all.
   key_header: Authorization
   key_prefix: "Bearer "
+  # Stay on the call while the team is working, up to timeout_s.
+  # Suggestions come only from a fresh milo_context digest. No digest means
+  # one brief line and then quiet. Milo does not invent tasks.
+  chat_while_waiting: true
+  context_table: milo_context
+  context_max_age_s: 21600
+  # Mention one or two digest items, once, while waiting. false keeps the
+  # call open but never offers items. Separate from chat_while_waiting.
+  suggest_pending_items: true
+  # Unsolicited nudges wait during this window (device timezone). none is off.
+  # A window may wrap midnight, for example "22:00-07:00".
+  nudge_quiet_hours: none
+  # After a nudge, the mic stays open this many seconds for a follow-up.
+  nudge_follow_up_s: 8
+
+# Meetings in the latest fresh milo_context digest. due must be ISO 8601 with
+# an offset. note "With Sarah Park, Park Lane" becomes the spoken name.
+# Quiet hours are bot_bridge.nudge_quiet_hours, when that is set.
+heads_up:
+  enabled: true
+  minutes_before: 10

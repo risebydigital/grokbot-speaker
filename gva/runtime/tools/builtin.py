@@ -172,6 +172,21 @@ def set_device_level(args: dict[str, Any], ctx) -> dict[str, Any]:
     return {"ok": True, "device": device_id, "name": known[device_id].name, "level": level}
 
 
+def defer_until_answer(args: dict[str, Any], ctx) -> dict[str, Any]:
+    """Leave the call. Milo nudges when the team answer arrives."""
+    bridge = getattr(ctx, "bridge", None)
+    if bridge is None or not hasattr(bridge, "defer"):
+        return {"status": "nothing_pending"}
+    try:
+        result = bridge.defer()
+    except Exception:
+        return {"status": "nothing_pending"}
+    status = str(result.get("status") or "nothing_pending")
+    if status != "deferred":
+        return {"status": "nothing_pending"}
+    return {"status": "deferred"}
+
+
 def check_team_answer(args: dict[str, Any], ctx) -> dict[str, Any]:
     """Return a team answer that arrived after Milo had already given up waiting."""
     bridge = getattr(ctx, "bridge", None)
@@ -230,4 +245,5 @@ HANDLERS = {
     "get_time": get_time,
     "ask_rbd_team": ask_rbd_team,
     "check_team_answer": check_team_answer,
+    "defer_until_answer": defer_until_answer,
 }

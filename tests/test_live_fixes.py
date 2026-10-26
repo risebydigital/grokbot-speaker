@@ -52,8 +52,15 @@ def test_jitter_prebuffer_and_underrun_silence():
     assert heard.shape == (10, 1)
     assert buffer.underruns == 0
     buffer.pull(1000)
-    assert buffer.underruns == 1
+    # The tail of a reply is not a gap, and the idle callback after it is not either.
+    assert buffer.underruns == 0
     buffer.pull(10)
+    assert buffer.underruns == 0
+    buffer.push(np.ones(10, dtype=np.int16).tobytes())
+    buffer.pull(10)
+    assert buffer.underruns == 0
+    buffer.pull(10)
+    assert buffer.underruns == 1
     drained = buffer.underruns
     buffer.pull(10)
     assert buffer.underruns == drained
