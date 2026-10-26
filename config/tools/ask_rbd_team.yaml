@@ -1,10 +1,12 @@
 name: ask_rbd_team
 description: >
   Use this for Rise By Digital work questions: Asana tasks, reports due,
-  client work, Adam's calendar, and emails. Pass the question in the
-  caller's words. When the tool returns sent, say that you are checking
-  with the team, then wait. Everything else is answered directly, without
-  this tool.
+  client work, Adam's calendar, and emails. Also use it when a digest item
+  has no details, or he asks for more than the latest update, or he asks
+  something those details do not cover. Pass the question in the caller's
+  words. When the tool returns sent, say that you are checking with the
+  team, then wait. Do not invent an answer. If he is asking about a digest
+  item that may already have an update, call read_digest_item first.
 timeout_s: 25
 risk: low
 personal_data: true

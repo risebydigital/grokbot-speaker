@@ -201,6 +201,26 @@ def check_team_answer(args: dict[str, Any], ctx) -> dict[str, Any]:
     return {"status": "ready", "answer": " ".join(answers)}
 
 
+def read_digest_item(args: dict[str, Any], ctx) -> dict[str, Any]:
+    """Speak a digest update, or ask the team when the update is not enough."""
+    title = str(args.get("title") or "").strip()
+    if not title:
+        return {"status": "missing"}
+    need = str(args.get("need") or "summary").strip().lower()
+    if need not in {"summary", "more"}:
+        need = "summary"
+    bridge = getattr(ctx, "bridge", None)
+    if bridge is None or not hasattr(bridge, "digest_followup"):
+        return {"status": "error", "error": "could not reach the team"}
+    try:
+        result = bridge.digest_followup(title, need=need)
+    except Exception:
+        return {"status": "error", "error": "could not reach the team"}
+    if not isinstance(result, dict):
+        return {"status": "error", "error": "could not reach the team"}
+    return result
+
+
 def ask_rbd_team(args: dict[str, Any], ctx) -> dict[str, Any]:
     """Hand a Rise By Digital work question to the bot bridge. No polling here."""
     question = str(args.get("question") or "").strip()
@@ -244,6 +264,7 @@ HANDLERS = {
     "get_calendar_events": get_calendar_events,
     "get_time": get_time,
     "ask_rbd_team": ask_rbd_team,
+    "read_digest_item": read_digest_item,
     "check_team_answer": check_team_answer,
     "defer_until_answer": defer_until_answer,
 }

@@ -160,7 +160,7 @@ def load_registry(cfg: Config, store: Store, http: Any | None = None, now: Calla
         for path in sorted(directory.glob("*.yaml")):
             data = yaml.safe_load(path.read_text(encoding="utf-8"))
             name = data["name"]
-            if name in {"ask_rbd_team", "check_team_answer", "defer_until_answer"} and not bridge_configured(cfg):
+            if name in {"ask_rbd_team", "check_team_answer", "defer_until_answer", "read_digest_item"} and not bridge_configured(cfg):
                 continue
             if name == "get_calendar_events" and bridge_configured(cfg):
                 data["description"] = (

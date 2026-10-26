@@ -82,6 +82,50 @@ def test_fresh_digest_is_used_and_a_secret_key_is_apikey_only(monkeypatch, tmp_p
     assert "sb_secret_testkey" not in str(blob)
 
 
+def test_digest_details_are_kept_and_only_https_links_are_stored(monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+
+    from gva.runtime.milo_context import spoken_update
+
+    now = datetime.now(timezone.utc)
+    as_of = datetime(2026, 6, 1, 9, 0, tzinfo=timezone.utc)
+    http = _Http(
+        200,
+        _row(
+            [
+                {
+                    "kind": "task",
+                    "title": "JG Locksmiths proposal",
+                    "details": "  The proposal is with the client. https://example.com/secret  ",
+                    "owner": "Sarah Chen",
+                    "status": "waiting",
+                    "link": "https://example.com/jg",
+                    "note": "Friday",
+                },
+                {"kind": "task", "title": "No link", "link": "http://example.com/no", "details": "x" * 900},
+            ],
+            now,
+        ),
+    )
+    bridge, _cfg, store = _bridge(tmp_path, monkeypatch, http)
+    items = bridge.waiting_context()
+    assert items[0]["details"] == "The proposal is with the client. https://example.com/secret"
+    assert items[0]["owner"] == "Sarah Chen"
+    assert items[0]["status"] == "waiting"
+    assert items[0]["link"] == "https://example.com/jg"
+    assert "link" not in items[1]
+    assert len(items[1]["details"]) == 800
+    said = spoken_update(items[0], as_of, "Europe/London")
+    assert said is not None
+    assert said.startswith("As of Brenda's 10am update,")
+    assert "https://" not in said
+    assert "example.com" not in said
+    assert "Sarah Chen owns it." in said
+    blob = str(store.recent(limit=20))
+    assert "JG Locksmiths" not in blob
+    assert "example.com" not in blob
+
+
 def test_stale_digest_is_ignored(monkeypatch, tmp_path):
     old = datetime.now(timezone.utc) - timedelta(hours=7)
     http = _Http(200, _row([{"kind": "report", "title": "Streets report", "due": "Friday"}], old))
