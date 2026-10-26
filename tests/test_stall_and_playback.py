@@ -21,6 +21,9 @@ class _HoldSink:
         self.held = 0
         self.stopped = False
         self.underruns = 0
+        # Seconds of audio still inside the hardware buffer after the ring is empty.
+        self.hardware_s = 0.0
+        self.last_output_at = 0.0
 
     def write(self, pcm: bytes) -> None:
         if self.stopped:
@@ -37,6 +40,13 @@ class _HoldSink:
 
     def queued_frames(self) -> int:
         return self.held
+
+    def audible_until(self) -> float:
+        if self.held > 0:
+            return time.monotonic() + max(self.hardware_s, 0.05)
+        if self.hardware_s > 0:
+            return time.monotonic() + self.hardware_s
+        return 0.0
 
     def drain(self) -> None:
         self.held = 0
@@ -219,6 +229,35 @@ def test_watchdog_exits_when_audio_or_wake_stalls(tmp_path):
     wake = store.recent("error", 1)[0]
     assert wake["error_code"] == "internal.stalled"
     assert "wake loop stalled" in wake["message"]
+    assert "playback" in wake["message"]
+
+
+def test_playback_progress_is_not_a_stall(tmp_path):
+    """A long reply freezes the session clock. The play head is still progress."""
+    _cfg, store, _events, assistant, sink = _assistant(tmp_path)
+    codes: list[int] = []
+    assistant._halt = codes.append
+    assistant._loops_started = True
+    assistant._stop.clear()
+    assistant.shutdown.clear()
+    assistant._stall_s = 30
+    assistant._in_session = True
+    assistant._session_at = time.monotonic() - 31
+    assistant.capture.running = True
+    assistant.capture.last_audio_at = time.monotonic() - 31
+    sink.last_output_at = time.monotonic()
+    assistant._watchdog_once()
+    assert codes == []
+    assert store.recent("error", 1) == []
+
+    sink.last_output_at = time.monotonic() - 31
+    assistant._watchdog_once()
+    assert codes == [1]
+    stalled = store.recent("error", 1)[0]
+    assert stalled["level"] == "error"
+    assert stalled["error_code"] == "audio.stalled"
+    assert "session" in stalled["message"]
+    assert "playback" in stalled["message"]
 
 
 def test_heartbeat_does_not_wait_for_the_wake_loop(tmp_path):
@@ -253,7 +292,7 @@ def test_server_clear_does_not_cut_queued_audio():
 
 
 def test_follow_up_starts_when_playback_finishes_not_when_queued(tmp_path):
-    cfg, _store, events, _assistant_obj, sink = _assistant(tmp_path)
+    cfg, store, events, _assistant_obj, sink = _assistant(tmp_path)
     cfg.conversation.realtime.listen_after_playback_s = 8
     protocol = RealtimeProtocol(cfg, events, _assistant_obj.store, None, sink)
     protocol.last_activity = 0
@@ -271,7 +310,23 @@ def test_follow_up_starts_when_playback_finishes_not_when_queued(tmp_path):
     assert protocol.sink.queued_frames() > 0
     assert idle_should_close(protocol, None, time.monotonic(), 0.01) is False
     protocol.mic_enabled = False
+    # Ring is empty but the DAC still holds the tail. The window stays shut.
+    protocol.sink.hardware_s = 5
     protocol.sink.drain()
+    protocol.note_output_idle()
+    assert protocol.listen_until == 0
+    assert protocol.mic_enabled is False
+    assert store.recent("playback.completed", 1) == []
+    # Device has drained. playback.completed is logged now, then the mic stays
+    # off for the short tail before the follow-up window opens.
+    protocol.sink.hardware_s = 0
+    protocol.note_output_idle()
+    assert protocol.listen_until == 0
+    assert protocol.mic_enabled is False
+    completed = store.recent("playback.completed", 1)[0]
+    assert completed["audio_ms"] == 100
+    assert completed["interrupted"] is False
+    protocol._ear_open_at = time.monotonic() - 1
     protocol.note_output_idle()
     remaining = protocol.listen_until - time.monotonic()
     assert 7.5 <= remaining <= 8.5
@@ -284,6 +339,7 @@ def test_follow_up_starts_when_playback_finishes_not_when_queued(tmp_path):
 def test_underrun_is_logged_with_a_count(tmp_path):
     _cfg, store, _events, assistant, sink = _assistant(tmp_path)
     protocol = RealtimeProtocol(assistant.cfg, assistant.events, store, None, sink)
+    protocol.speaking = True
     sink.underruns = 4
     assistant._emit_underruns(protocol)
     event = store.recent("playback.underrun", 1)[0]
@@ -292,6 +348,50 @@ def test_underrun_is_logged_with_a_count(tmp_path):
     assert event["underruns"] == 4
     assistant._emit_underruns(protocol)
     assert len(store.recent("playback.underrun", 5)) == 1
+
+
+def test_end_of_stream_underrun_is_not_logged(tmp_path):
+    _cfg, store, _events, assistant, sink = _assistant(tmp_path)
+    protocol = RealtimeProtocol(assistant.cfg, assistant.events, store, None, sink)
+    sink.underruns = 1
+    assistant._emit_underruns(protocol)
+    assert store.recent("playback.underrun", 5) == []
+    protocol.speaking = True
+    sink.underruns = 1
+    assistant._emit_underruns(protocol)
+    event = store.recent("playback.underrun", 1)[0]
+    assert event["count"] == 1
+
+
+def test_server_does_not_hear_the_speaker(tmp_path):
+    cfg, store, events, _assistant_obj, sink = _assistant(tmp_path)
+    protocol = RealtimeProtocol(cfg, events, store, None, sink)
+    frame = b"\x01\x00" * 160
+    opened = protocol.mic_messages(frame)
+    assert opened[0]["type"] == "input_audio_buffer.append"
+    assert "input_audio_buffer.clear" not in {item["type"] for item in opened}
+    pcm = b"\x02\x00" * 2400
+    protocol.on_event({"type": "response.created", "response": {"id": "r"}})
+    protocol.on_event(
+        {"type": "response.output_audio.delta", "delta": base64.b64encode(pcm).decode("ascii"), "response_id": "r"}
+    )
+    assert protocol.mic_messages(frame) == [{"type": "input_audio_buffer.clear"}]
+    assert protocol.mic_messages(frame) == []
+    assert protocol.mic_enabled is False
+    protocol.on_event({"type": "response.done", "response": {"id": "r", "status": "completed"}})
+    assert store.recent("playback.completed", 1) == []
+    protocol.playback.get_nowait()
+    sink.hardware_s = 1
+    sink.drain()
+    assert protocol.speaker_drained() is False
+    assert protocol.mic_messages(frame) == []
+    sink.hardware_s = 0
+    resumed = protocol.mic_messages(frame)
+    assert resumed == []
+    protocol._ear_open_at = time.monotonic() - 1
+    resumed = protocol.mic_messages(frame)
+    assert [item["type"] for item in resumed] == ["input_audio_buffer.clear", "input_audio_buffer.append"]
+    assert protocol.mic_enabled is True
 
 
 def test_local_clip_joins_the_player_only_while_it_is_live():
