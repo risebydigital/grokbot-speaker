@@ -38,6 +38,7 @@ config_app = typer.Typer(help="Non-secret configuration.")
 logs_app = typer.Typer(help="JSONL event log.")
 tools_app = typer.Typer(help="Function-calling tools.")
 models_app = typer.Typer(help="Wake-word and voice downloads.")
+wake_app = typer.Typer(help="Wake-word scoring.")
 auth_app = typer.Typer(help="Local API tokens.")
 maintenance_app = typer.Typer(help="Retention and backups.")
 sync_app = typer.Typer(help="Supabase sync.")
@@ -47,6 +48,7 @@ app.add_typer(config_app, name="config")
 app.add_typer(logs_app, name="logs")
 app.add_typer(tools_app, name="tools")
 app.add_typer(models_app, name="models")
+app.add_typer(wake_app, name="wake")
 app.add_typer(auth_app, name="auth")
 app.add_typer(maintenance_app, name="maintenance")
 app.add_typer(sync_app, name="sync")
@@ -385,7 +387,11 @@ def tools_test(name: str, arguments: str = "{}") -> None:
 
 @models_app.command("download")
 def models_download() -> None:
-    """Download hey_jarvis and the en_GB Piper voice. Needs a network."""
+    """Download ONNX wake models and the en_GB Piper voice. Needs a network.
+
+    A shipped milo.onnx is copied into the wake directory. hey_jarvis is downloaded
+    when that is the configured model, or when milo.onnx is missing.
+    """
     cfg = _cfg()
     wake_dir = Path(cfg.wake.model_dir)
     try:
@@ -394,10 +400,15 @@ def models_download() -> None:
         typer.echo(f"cannot create {wake_dir}: {exc.__class__.__name__}", err=True)
         raise typer.Exit(1) from exc
     try:
-        from gva.runtime.wake import download_onnx_models
+        from gva.runtime.wake import copy_shipped_milo, download_onnx_models, resolve_wake_model
 
-        spec = cfg.wake.model
-        names = [] if spec.endswith(".onnx") else [spec]
+        copied = copy_shipped_milo(wake_dir)
+        if copied is not None:
+            typer.echo(f"shipped Milo model at {copied}")
+        spec, fell_back = resolve_wake_model(cfg.wake.model, str(wake_dir))
+        if fell_back:
+            typer.echo('milo.onnx is missing. Downloading hey_jarvis. Say "hey jarvis".', err=True)
+        names = [] if spec.endswith(".onnx") and Path(spec).is_file() else [spec]
         download_onnx_models(names, str(wake_dir))
         typer.echo(f"ONNX wake models in {wake_dir}")
     except Exception as exc:
@@ -447,6 +458,77 @@ def models_fallbacks() -> None:
     ]
     (directory / "phrases.txt").write_text("\n".join(phrases) + "\n", encoding="utf-8")
     typer.echo(f"wrote {directory / 'phrases.txt'}")
+
+
+@wake_app.command("test")
+def wake_test(
+    seconds: float = typer.Option(8.0, "--seconds", min=1.0, max=120.0, help="How long to print scores."),
+) -> None:
+    """Print live wake scores for a few seconds so the threshold can be tuned.
+
+    Nothing is uploaded. Say the wake phrase and watch the score against wake.threshold.
+    """
+    cfg = _cfg()
+    from gva.runtime.audio import SoundDeviceCapture, list_devices, resample_pcm, resolve_device
+    from gva.runtime.wake import OpenWakeWordEngine, format_wake_line
+
+    devices = list_devices()
+    if devices and devices[0].get("error"):
+        typer.echo(devices[0]["error"], err=True)
+        raise typer.Exit(1)
+    engine = OpenWakeWordEngine(
+        cfg.wake.model,
+        cfg.wake.model_dir,
+        cfg.wake.threshold,
+        cfg.wake.patience_frames,
+        cfg.wake.refractory_seconds,
+        cfg.wake.phrase,
+    )
+    spec = engine.model_spec
+    typer.echo(f"model: {spec}")
+    typer.echo(f"phrase: {cfg.wake.phrase}")
+    typer.echo(f"threshold: {cfg.wake.threshold:.2f}  patience: {cfg.wake.patience_frames} frames")
+    if spec.endswith("milo.onnx"):
+        typer.echo('Say "milo" or "hey milo".')
+    elif engine.fell_back:
+        typer.echo('Say "hey jarvis".')
+    else:
+        typer.echo(f'Say "{cfg.wake.phrase}".')
+    typer.echo(f"listening for {seconds:.0f}s. A line is one {cfg.audio.chunk_ms} ms frame.")
+    capture = SoundDeviceCapture(
+        resolve_device(cfg.audio.input_device, "input"),
+        cfg.audio.capture_rate,
+        cfg.audio.chunk_ms,
+    )
+    try:
+        capture.start()
+    except Exception as exc:
+        typer.echo(f"microphone failed: {exc.__class__.__name__}: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    peak = 0.0
+    elapsed = 0.0
+    chunk_s = cfg.audio.chunk_ms / 1000
+    deadline = time.monotonic() + seconds
+    try:
+        while time.monotonic() < deadline:
+            raw = capture.read(0.5)
+            if not raw:
+                continue
+            heard = resample_pcm(raw, cfg.audio.capture_rate, cfg.audio.sample_rate)
+            if not heard:
+                continue
+            score = float(engine.score(heard))
+            fired = bool(engine.observe(score))
+            peak = max(peak, score)
+            typer.echo(format_wake_line(elapsed, score, fired))
+            elapsed += chunk_s
+    finally:
+        capture.stop()
+    typer.echo(f"max score {peak:.3f}")
+    typer.echo(
+        f"threshold is {cfg.wake.threshold:.2f}. "
+        "Raise it if the room false-wakes. Lower it if the phrase is missed."
+    )
 
 
 @auth_app.command("token")

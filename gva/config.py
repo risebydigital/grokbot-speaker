@@ -42,6 +42,8 @@ class AudioConfig(BaseModel):
 
 class WakeConfig(BaseModel):
     engine: str = "openwakeword"
+    # hey_jarvis is the stock model. "milo" loads assets/wakewords/milo.onnx
+    # (also hears "hey milo") and falls back to hey_jarvis if that file is missing.
     model: str = "hey_jarvis"
     phrase: str = "hey jarvis"
     model_dir: str = "/usr/share/gva/wake"

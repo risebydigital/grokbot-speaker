@@ -19,7 +19,7 @@ Milo sits in a room, listens for a wake phrase, and holds a spoken conversation 
 
 The default path is speech-to-speech over a WebSocket (`grok-voice-latest`, voice `eve`). A local cascade (faster-whisper, Grok chat, Piper) stays available when you set `conversation.engine` to `local`.
 
-Until a custom model is trained, the wake phrase is **hey jarvis**. The product name is Milo.
+Until a custom model clears the validation bar, the wake phrase is **hey jarvis**. The product name is Milo. A Milo ONNX model ships in [`assets/wakewords/milo.onnx`](assets/wakewords/milo.onnx) and also hears "hey milo". It is not the default: on the openWakeWord validation set the best row is about 0.80 recall with roughly 31 false accepts per hour, and confusable phrases such as Miles and Mylo still get through. Numbers and the threshold to try are in [`assets/wakewords/MODEL_CARD.md`](assets/wakewords/MODEL_CARD.md). Set `wake.model: milo` and `wake.phrase: "milo"` to use it. If `milo.onnx` is missing, the runtime says so and scores hey_jarvis.
 
 ## Architecture
 
@@ -116,8 +116,8 @@ Non-secret settings live in `/etc/gva/config.yaml`, seeded from [`config/config.
 | `audio.capture_rate` | `48000` | Microphone rate |
 | `audio.playback_prebuffer_ms` | `200` | Audio queued before the speaker leaves silence |
 | `audio.playback_latency` | `high` | PortAudio latency hint (`high` or `low`) |
-| `wake.model` | `hey_jarvis` | openWakeWord model name, or a path to ONNX |
-| `wake.phrase` | `hey jarvis` | Phrase you say |
+| `wake.model` | `hey_jarvis` | `hey_jarvis`, or `milo` for the shipped ONNX file |
+| `wake.phrase` | `hey jarvis` | Phrase you say. Use `milo` when `wake.model` is `milo` |
 | `wake.threshold` | `0.6` | Score that counts as a hit |
 | `wake.patience_frames` | `2` | Hits in a row before the session opens |
 | `wake.cooldown_seconds` | `3` | Quiet time after a session |
@@ -215,7 +215,22 @@ After every session Milo drops the openWakeWord model and loads a fresh one, req
 
 Raspberry Pi OS Trixie ships Python 3.13. `openwakeword` depends on `tflite-runtime` on Linux, and that project has no wheel for 3.13, so `pip install -e ".[voice]"` fails. `deploy/install.sh` does not ignore that failure. It installs faster-whisper, piper-tts, sounddevice, onnxruntime, scipy, scikit-learn, tqdm, and requests, then installs `openwakeword` with `--no-deps`. Milo loads ONNX models only (`inference_framework="onnx"`), including the melspectrogram and embedding nets.
 
-`gva doctor` reports any of those imports that are missing. `gva models download` fetches the ONNX files, not the TFLite ones.
+`gva doctor` reports any of those imports that are missing. `gva models download` fetches the ONNX files, not the TFLite ones, and copies `assets/wakewords/milo.onnx` into the wake directory when that file is in the checkout. `deploy/update.sh` copies it to `/usr/share/gva/wake/milo.onnx`.
+
+`gva wake test` prints a live score every 80 ms for a few seconds (eight by default, `--seconds` to change it). Nothing is uploaded. Say the phrase and compare the score with `wake.threshold`.
+
+### Wake phrase
+
+The installed default is hey_jarvis, threshold 0.6, two frames in a row. To try the shipped Milo model:
+
+```yaml
+wake:
+  model: milo
+  phrase: "milo"
+  threshold: 0.6
+```
+
+`milo` also hears "hey milo". The validation sweep does not yet justify making that the default. Tune the threshold on the AIRHUG with `gva wake test` before leaving it on.
 
 ### Speaker format
 
@@ -263,7 +278,7 @@ The dashboard reads Supabase with the anon key under row-level security. The ser
 
 ## Roadmap
 
-- A trained Milo wake model, via `tools/wake/train_milo.py`. Until that file is installed, the phrase stays "hey jarvis".
+- The Milo wake model is trained and shipped, but hey jarvis stays the default until a run clears the validation bar in `assets/wakewords/MODEL_CARD.md`. Try it with `wake.model: milo`.
 - The Voice Ops Dashboard, reading redacted telemetry from Supabase.
 - The local whisper / Piper cascade remains the fallback when the realtime socket should stay closed.
 

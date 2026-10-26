@@ -22,8 +22,11 @@ from gva.runtime.wake import (
     INFERENCE_FRAMEWORK,
     OpenWakeWordEngine,
     download_onnx_models,
+    format_wake_line,
     onnx_download_urls,
     onnx_runtime_kwargs,
+    resolve_wake_model,
+    score_report,
 )
 
 
@@ -150,6 +153,55 @@ def test_engine_constructs_openwakeword_with_onnx(monkeypatch, tmp_path):
     assert captured["wakeword_models"][0].endswith("hey_jarvis_v0.1.onnx")
 
 
+def test_milo_path_is_used_when_the_file_is_present(tmp_path):
+    model = tmp_path / "milo.onnx"
+    model.write_bytes(b"onnx")
+    spec, fell_back = resolve_wake_model("milo", str(tmp_path))
+    assert spec == str(model)
+    assert fell_back is False
+
+
+def test_shipped_milo_is_used_when_the_wake_directory_is_empty(monkeypatch, tmp_path):
+    shipped = tmp_path / "shipped.onnx"
+    shipped.write_bytes(b"onnx")
+    monkeypatch.setattr("gva.runtime.wake.shipped_wake_model", lambda: shipped)
+    empty = tmp_path / "wake"
+    empty.mkdir()
+    spec, fell_back = resolve_wake_model("milo", str(empty))
+    assert spec == str(shipped)
+    assert fell_back is False
+
+
+def test_missing_milo_falls_back_to_hey_jarvis(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr("gva.runtime.wake.shipped_wake_model", lambda: tmp_path / "absent.onnx")
+    spec, fell_back = resolve_wake_model("milo", str(tmp_path))
+    assert spec == "hey_jarvis"
+    assert fell_back is True
+    engine = OpenWakeWordEngine("milo", str(tmp_path), 0.5, 2, 0, "milo")
+    err = capsys.readouterr().err
+    assert engine.model_spec == "hey_jarvis"
+    assert engine.fell_back is True
+    assert "hey jarvis" in err
+
+
+def test_wake_score_lines_mark_a_hit():
+    class Engine:
+        def __init__(self):
+            self.logic_scores = [0.1, 0.8, 0.9]
+
+        def score(self, frame):
+            return self.logic_scores.pop(0)
+
+        def observe(self, score):
+            return score >= 0.8
+
+    lines, peak = score_report(Engine(), [b"a", b"b", b"c"], chunk_s=0.08)
+    assert lines[0] == "  0.00s  score=0.100  ."
+    assert lines[1] == format_wake_line(0.08, 0.8, True)
+    assert "WAKE" in lines[1]
+    assert peak == 0.9
+
+
 def test_doctor_names_missing_voice_packages():
     problems = voice_import_problems(find_spec=lambda name: None)
     text = " ".join(problems)
@@ -200,6 +252,8 @@ def test_install_scripts_fail_closed_and_use_onnx_wake():
     assert "install_voice_python" in install
     assert "Voice extras did not install" not in install
     assert "install_voice_python" in update
+    assert "install_shipped_wake_model" in update
+    assert "install_shipped_wake_model" in install
     assert '[voice]' not in update
     assert "chmod 644" in permissions
     assert "chmod 600" in permissions

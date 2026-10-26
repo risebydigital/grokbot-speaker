@@ -35,3 +35,17 @@ install_voice_python() {
     return 1
   fi
 }
+
+# Copy the shipped Milo ONNX model into the directory the voice service reads.
+# hey_jarvis is downloaded later and stays the fallback when this file is absent.
+install_shipped_wake_model() {
+  local app="$1"
+  local src="$app/assets/wakewords/milo.onnx"
+  install -d -m 755 /usr/share/gva/wake
+  if [[ ! -f "$src" ]]; then
+    echo "No shipped Milo wake model at $src. hey_jarvis remains the fallback."
+    return 0
+  fi
+  install -m 644 "$src" /usr/share/gva/wake/milo.onnx
+  echo "Copied Milo wake model to /usr/share/gva/wake/milo.onnx"
+}

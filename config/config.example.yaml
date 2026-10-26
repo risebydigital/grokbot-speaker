@@ -30,9 +30,10 @@ audio:
 
 wake:
   engine: openwakeword
-  # Pretrained model name, or an absolute path to a custom ONNX file.
-  # Out of the box this is openWakeWord's "hey_jarvis" model: say "hey jarvis".
-  # After you train Milo, set model to /usr/share/gva/wake/milo.onnx (or hey_milo.onnx).
+  # hey_jarvis is the stock openWakeWord model: say "hey jarvis".
+  # milo loads /usr/share/gva/wake/milo.onnx (shipped in the repo, also hears "hey milo").
+  # If that file is missing, the runtime uses hey_jarvis.
+  # Recommended Milo threshold is in assets/wakewords/MODEL_CARD.md.
   model: hey_jarvis
   phrase: "hey jarvis"
   model_dir: /usr/share/gva/wake
