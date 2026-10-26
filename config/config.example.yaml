@@ -31,9 +31,11 @@ audio:
 wake:
   engine: openwakeword
   # hey_jarvis is the stock openWakeWord model: say "hey jarvis".
-  # milo loads /usr/share/gva/wake/milo.onnx (shipped in the repo, also hears "hey milo").
+  # milo loads /usr/share/gva/wake/milo.onnx (shipped in the repo).
+  # That file is trained for "hey milo". Bare "milo" is a secondary phrase.
   # If that file is missing, the runtime uses hey_jarvis.
   # Recommended Milo threshold is in assets/wakewords/MODEL_CARD.md.
+  # To try it: model: milo, phrase: "hey milo".
   model: hey_jarvis
   phrase: "hey jarvis"
   model_dir: /usr/share/gva/wake

@@ -15,8 +15,17 @@ Two Piper front ends are used:
   English, jenny, aru, vctk, lessac, amy, ryan, joe), with speed, noise,
   and a pitch shift
 
-The negative set includes the confusable phrases Miles, my low, hello,
-mellow, Milan, and Mylo, plus "hey" in front of each.
+The primary phrase is "hey milo". "milo" is one clip in five, so a bare
+name still has a chance of scoring, but the model is aimed at the two-word
+phrase. The negative set includes the confusable phrases Miles, my low,
+hello, mellow, Milan, and Mylo, plus "hey" in front of each.
+
+Real AIRHUG clips, once copied off the Pi, are mixed in with::
+
+    /tmp/oww-venv/bin/python tools/wake/train_milo.py --train --real-samples /path/to/2026-10-26
+
+Held-out real clips are not used for training. Their recall is printed
+beside the synthetic numbers.
 
 Run it with the training virtualenv after the datasets are on disk::
 
@@ -42,7 +51,9 @@ ROOT = Path(__file__).resolve().parents[2]
 OWW = Path(os.environ.get("MILO_OWW_ROOT", "/tmp/oww"))
 DATA = Path(os.environ.get("MILO_DATA", "/tmp/oww-data"))
 
-POSITIVES = ("milo", "hey milo")
+# Four clips of the two-word phrase, then one bare "milo".
+PHRASE_MIX = ("hey milo", "hey milo", "hey milo", "hey milo", "milo")
+PHRASE_MIX_ID = "hey-milo-primary-v1"
 CONFUSABLES = (
     "miles",
     "my low",
@@ -339,7 +350,7 @@ def write_config(
         custom.extend([phrase] * 6)
     config = {
         "model_name": "milo",
-        "target_phrase": list(POSITIVES),
+        "target_phrase": list(PHRASE_MIX),
         "custom_negative_phrases": custom,
         "n_samples": n_samples,
         "n_samples_val": n_val,
@@ -580,7 +591,7 @@ def probe_libritts(seconds_budget: float) -> int:
     probe.mkdir()
     started = time.monotonic()
     generate_samples(
-        text=["milo", "hey milo"],
+        text=list(PHRASE_MIX),
         max_samples=4,
         batch_size=2,
         noise_scales=[0.8],
@@ -757,7 +768,190 @@ def evaluate(model_path: Path, feature_dir: Path, positive_wavs: list[Path], neg
     }
 
 
-def write_model_card(metrics: dict, steps: int, n_samples: int, n_val: int, destination: Path) -> None:
+def reset_for_phrase_mix(model_dir: Path) -> None:
+    """Drop clips and features when they were built for a different phrase mix.
+
+    The trainer skips synthesis once a directory already holds enough wavs, so an
+    older half-and-half "milo" / "hey milo" set would be reused forever.
+    """
+    marker = model_dir / "phrase_mix.txt"
+    current = marker.read_text(encoding="utf-8").strip() if marker.is_file() else ""
+    if current == PHRASE_MIX_ID:
+        return
+    print(f"phrase mix {current or 'unset'} -> {PHRASE_MIX_ID}; clearing clips and features", flush=True)
+    for name in ("positive_train", "positive_test", "negative_train", "negative_test"):
+        directory = model_dir / name
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.wav"):
+            path.unlink()
+    for path in model_dir.glob("*.npy"):
+        path.unlink()
+    marker.write_text(PHRASE_MIX_ID + "\n", encoding="utf-8")
+
+
+def _holdout_split(paths: list[Path], fraction: float = 0.2) -> tuple[list[Path], list[Path]]:
+    """Last slice is held out. Fewer than five clips all stay in training."""
+    ordered = sorted(paths)
+    if len(ordered) < 5:
+        return ordered, []
+    hold = max(1, int(round(len(ordered) * fraction)))
+    hold = min(hold, len(ordered) - 1)
+    return ordered[:-hold], ordered[-hold:]
+
+
+def resolve_real_root(path: Path) -> Path:
+    """A date folder, or the latest date folder under a sample root."""
+    path = Path(path)
+    if not path.is_dir():
+        raise SystemExit(f"No real samples at {path}")
+    if any((path / name).is_dir() for name in ("positive", "negative", "background")):
+        return path
+    dated = sorted(
+        child
+        for child in path.iterdir()
+        if child.is_dir() and any((child / name).is_dir() for name in ("positive", "negative"))
+    )
+    if not dated:
+        raise SystemExit(f"No positive/ or negative/ under {path}")
+    chosen = dated[-1]
+    print(f"using real samples in {chosen.name}", flush=True)
+    return chosen
+
+
+def mix_real_samples(model_dir: Path, real_root: Path) -> dict:
+    """Copy the training split in beside the synthetic clips and keep a holdout."""
+    positive = sorted((real_root / "positive").glob("*.wav")) if (real_root / "positive").is_dir() else []
+    negative = sorted((real_root / "negative").glob("*.wav")) if (real_root / "negative").is_dir() else []
+    if not positive and not negative:
+        raise SystemExit(f"No wav files in {real_root}/positive or {real_root}/negative")
+    pos_train, pos_hold = _holdout_split(positive)
+    neg_train, neg_hold = _holdout_split(negative)
+    for source in pos_train:
+        shutil.copyfile(source, model_dir / "positive_train" / f"real_{source.name}")
+    for source in neg_train:
+        shutil.copyfile(source, model_dir / "negative_train" / f"real_{source.name}")
+    for path in model_dir.glob("*.npy"):
+        path.unlink()
+    background = real_root / "background"
+    has_background = background.is_dir() and any(background.glob("*.wav"))
+    print(
+        f"real samples train {len(pos_train)} positive / {len(neg_train)} negative; "
+        f"held out {len(pos_hold)} positive / {len(neg_hold)} negative",
+        flush=True,
+    )
+    return {
+        "used": True,
+        "train_positive": len(pos_train),
+        "train_negative": len(neg_train),
+        "holdout_positive": len(pos_hold),
+        "holdout_negative": len(neg_hold),
+        "background": has_background,
+        "background_dir": background if has_background else None,
+        "holdout_positive_paths": pos_hold,
+        "holdout_negative_paths": neg_hold,
+    }
+
+
+def score_real_clips(model_path: Path, positive_wavs: list[Path], negative_wavs: list[Path]) -> list[dict]:
+    """Patience-2 streaming scores on held-out real wavs. Same rule as the device."""
+    if not positive_wavs and not negative_wavs:
+        return []
+    import numpy as np
+
+    sys.path.insert(0, str(OWW / "openwakeword"))
+    from openwakeword.model import Model
+
+    runtime = Model(wakeword_models=[str(model_path)], inference_framework="onnx")
+    key = model_path.stem
+
+    def rows_for(paths: list[Path]) -> list[list[float]]:
+        rows = []
+        for path in paths:
+            frames = runtime.predict_clip(str(path))
+            rows.append([float(frame.get(key, 0.0)) for frame in frames])
+            runtime.reset()
+        return rows
+
+    positive_scores = rows_for(positive_wavs)
+    negative_scores = rows_for(negative_wavs)
+    thresholds = [round(float(value), 2) for value in np.arange(0.30, 0.91, 0.05)]
+    rows = []
+    for threshold in thresholds:
+        recall = (
+            float(np.mean([_clip_fires(scores, threshold) for scores in positive_scores]))
+            if positive_scores
+            else None
+        )
+        confusable = (
+            float(np.mean([_clip_fires(scores, threshold) for scores in negative_scores]))
+            if negative_scores
+            else None
+        )
+        rows.append(
+            {
+                "threshold": threshold,
+                "recall": None if recall is None else round(recall, 4),
+                "confusable_accept_rate": None if confusable is None else round(confusable, 4),
+            }
+        )
+    return rows
+
+
+def format_real_block(info: dict | None) -> str:
+    if not info or not info.get("used"):
+        return (
+            "## Real clips\n\n"
+            "This run did not include AIRHUG recordings. On the Pi, `sudo gva wake record` "
+            "then `sudo gva wake export`. Copy the archive off the Pi, unpack it, and train "
+            "again with `--real-samples` pointing at the date folder. Real positives are "
+            "augmented with the synthetic clips. The last fifth of each real class (when "
+            "there are at least five clips) is held out and scored with the same two-frame rule.\n"
+        )
+    lines = [
+        "## Real clips",
+        "",
+        (
+            f"Real AIRHUG takes mixed into training: {info['train_positive']} positive and "
+            f"{info['train_negative']} negative. They are augmented with the same room impulse "
+            "responses and noise as the synthetic clips. The ACAV negatives and the synthetic "
+            "confusable set stay in the batch."
+        ),
+        "",
+    ]
+    if info["holdout_positive"] == 0 and info["holdout_negative"] == 0:
+        lines.append(
+            "Fewer than five real clips in each class, so every real clip stayed in training. "
+            "There is no held-out real score for this run."
+        )
+    else:
+        lines.append(
+            f"Held out of training: {info['holdout_positive']} positive and "
+            f"{info['holdout_negative']} negative. Scored with two frames over the threshold."
+        )
+        lines.append("")
+        lines.append("| threshold | real recall | real confusable accept |")
+        lines.append("| --- | --- | --- |")
+        for row in info.get("sweep") or []:
+            recall = "n/a" if row["recall"] is None else f"{row['recall']:.3f}"
+            confusable = "n/a" if row["confusable_accept_rate"] is None else f"{row['confusable_accept_rate']:.3f}"
+            lines.append(f"| {row['threshold']:.2f} | {recall} | {confusable} |")
+        chosen = info.get("at_recommended")
+        if chosen:
+            recall = "n/a" if chosen["recall"] is None else f"{chosen['recall']:.3f}"
+            confusable = "n/a" if chosen["confusable_accept_rate"] is None else f"{chosen['confusable_accept_rate']:.3f}"
+            lines.append("")
+            lines.append(
+                f"At the recommended threshold {chosen['threshold']:.2f}, held-out real recall is {recall} "
+                f"and held-out real confusable accept is {confusable}."
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_model_card(
+    metrics: dict, steps: int, n_samples: int, n_val: int, destination: Path, real_block: str
+) -> None:
     sweep = "\n".join(
         f"| {row['threshold']:.2f} | {row['recall']:.3f} | {row['confusable_accept_rate']:.3f} | "
         f"{row['false_accepts_per_hour']:.3f} | {row['raw_windows_per_hour']:.1f} |"
@@ -778,15 +972,16 @@ def write_model_card(metrics: dict, steps: int, n_samples: int, n_val: int, dest
         )
     text = f"""# Milo wake model
 
-Binary openWakeWord classifier for **milo** and **hey milo**. The file is ONNX
-because the Pi runs Python 3.13, which has no `tflite-runtime` wheel.
+Binary openWakeWord classifier for **hey milo**. **milo** is a secondary phrase,
+about one synthetic clip in five. The file is ONNX because the Pi runs
+Python 3.13, which has no `tflite-runtime` wheel.
 
 ## Training
 
 * Pipeline: [openWakeWord automatic training](https://github.com/dscripka/openWakeWord/blob/main/notebooks/automatic_model_training.ipynb) (`openwakeword/train.py`).
 * Steps: {steps} on the first cosine cycle, then {max(1, steps // 10)} and another {max(1, steps // 10)}. Checkpoint averaging is the stock procedure. Negative-example weight rises from 1 to 200 and is not doubled between sequences: the stock tracker never updates its false-positive count, so the doubling collapses a short CPU run into an all-negative model. Each batch has 48 positives, 64 adversarial negatives (confusables and phoneme overlap), and 128 generic ACAV windows. This is shorter than the notebook's 50,000-step default so it finishes on CPU.
 * Classifier: fully connected, layer size 64, input `(batch, 16, 96)` from the v0.5.1 embedding model (the same ONNX file the runtime downloads).
-* Positive clips: about {n_samples} training and {n_val} validation, half "milo" and half "hey milo". The positive directory can be a bit larger when an earlier generation pass added clips; every wav in that directory is augmented.
+* Positive clips: about {n_samples} training and {n_val} validation. Four out of five are "hey milo". "milo" is the secondary phrase. Real AIRHUG takes, when `--real-samples` is set, are copied into the same directories and augmented with the synthetic clips. One in five of those real takes (when there are at least five) is held out and is not trained on.
 * Voices: Piper ONNX British voices (alan, alba, cori, northern English male, jenny, aru, vctk) and other English voices (lessac, amy, ryan, joe), plus the LibriTTS multi-speaker Piper checkpoint from piper-sample-generator. Speed uses Piper length scales 0.85, 1.0, and 1.15. Pitch is shifted by -2 to +2 semitones. LibriTTS also varies speaker interpolation and duration noise.
 * Confusable negatives, synthesised on purpose: Miles, my low, hello, mellow, Milan, Mylo, and the same phrases with "hey" in front. The trainer also adds phoneme-overlap adversaries.
 * Augmentation: openWakeWord's augmenter (EQ, distortion, pitch shift, noise, gain) mixed with MIT environmental room impulse responses (`davidscripka/MIT_environmental_impulse_responses`, 270 files) and 250 clips from AudioSet balanced shard 09 (the parquet that replaced `bal_train09.tar`). A Free Music Archive slice was requested and skipped: that dataset's zip cannot be read as a stream.
@@ -810,6 +1005,7 @@ At that threshold, recall is {metrics['recommended_recall']:.3f}, false accepts 
 {advice}
 Shipped default: `{default}`. The default stays `hey_jarvis` unless recall is at least 0.8 and false accepts per hour are at most 0.5, with confusable clips accepted no more than 2 percent of the time.
 
+{real_block}
 ## Licence
 
 The classifier weights were trained for this project. openWakeWord is Apache-2.0. The embedding and melspectrogram networks it depends on are the v0.5.1 ONNX files published with openWakeWord. The stock `hey_jarvis` model, used when this file is missing, is CC BY-NC-SA 4.0.
@@ -824,6 +1020,12 @@ def main() -> int:
     parser.add_argument("--piper-per-voice", type=int, default=24, help="Training clips per ONNX voice, split across its speakers.")
     parser.add_argument("--piper-val-per-voice", type=int, default=6)
     parser.add_argument("--libritts-seconds", type=float, default=8 * 60, help="CPU time budget for the LibriTTS generator.")
+    parser.add_argument(
+        "--real-samples",
+        type=Path,
+        default=None,
+        help="Date folder from `gva wake record`, or a root that contains date folders.",
+    )
     args = parser.parse_args()
     if not args.train:
         print("Pass --train to build assets/wakewords/milo.onnx. See the module docstring.")
@@ -838,11 +1040,12 @@ def main() -> int:
     model_dir = output_dir / "milo"
     for name in ("positive_train", "positive_test", "negative_train", "negative_test"):
         (model_dir / name).mkdir(parents=True, exist_ok=True)
+    reset_for_phrase_mix(model_dir)
 
     print("synthesising Piper ONNX clips", flush=True)
     if _count_wavs(model_dir / "positive_train") < 100:
-        synthesise_piper(model_dir / "positive_train", POSITIVES, args.piper_per_voice, "pos")
-        synthesise_piper(model_dir / "positive_test", POSITIVES, args.piper_val_per_voice, "pos")
+        synthesise_piper(model_dir / "positive_train", PHRASE_MIX, args.piper_per_voice, "pos")
+        synthesise_piper(model_dir / "positive_test", PHRASE_MIX, args.piper_val_per_voice, "pos")
         synthesise_piper(model_dir / "negative_train", CONFUSABLES, max(8, args.piper_per_voice // 2), "neg")
         synthesise_piper(model_dir / "negative_test", CONFUSABLES, max(4, args.piper_val_per_voice // 2), "neg")
     print(
@@ -870,7 +1073,13 @@ def main() -> int:
         n_val = pos_val + extra_val
         print(f"n_samples={n_samples} n_val={n_val} steps={args.steps}", flush=True)
 
+    real_info = None
+    if args.real_samples:
+        real_root = resolve_real_root(args.real_samples)
+        real_info = mix_real_samples(model_dir, real_root)
     rir_dirs, noise_dirs = prepare_backgrounds()
+    if real_info and real_info.get("background_dir"):
+        noise_dirs.append(real_info["background_dir"])
     config_path = output_dir / "milo.yaml"
     write_config(config_path, output_dir, n_samples, n_val, args.steps, rir_dirs, noise_dirs)
     patch_trainer(OWW / "openwakeword" / "openwakeword" / "train.py")
@@ -894,13 +1103,44 @@ def main() -> int:
     metrics["steps"] = args.steps
     metrics["n_samples"] = n_samples
     metrics["n_val"] = n_val
+    metrics["phrase_mix"] = PHRASE_MIX_ID
+    if real_info and real_info.get("used"):
+        sweep = score_real_clips(
+            produced,
+            real_info["holdout_positive_paths"],
+            real_info["holdout_negative_paths"],
+        )
+        real_info["sweep"] = sweep
+        real_info["at_recommended"] = next(
+            (row for row in sweep if row["threshold"] == metrics["recommended_threshold"]),
+            None,
+        )
+        metrics["real"] = {
+            "used": True,
+            "train_positive": real_info["train_positive"],
+            "train_negative": real_info["train_negative"],
+            "holdout_positive": real_info["holdout_positive"],
+            "holdout_negative": real_info["holdout_negative"],
+            "background": real_info["background"],
+            "sweep": sweep,
+            "at_recommended": real_info["at_recommended"],
+        }
+    else:
+        metrics["real"] = {"used": False}
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print(json.dumps({key: metrics[key] for key in metrics if key != "sweep"}, indent=2), flush=True)
 
     asset_dir = ROOT / "assets" / "wakewords"
     asset_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(produced, asset_dir / "milo.onnx")
-    write_model_card(metrics, args.steps, n_samples, n_val, asset_dir / "MODEL_CARD.md")
+    write_model_card(
+        metrics,
+        args.steps,
+        n_samples,
+        n_val,
+        asset_dir / "MODEL_CARD.md",
+        format_real_block(real_info),
+    )
     print(f"wrote {asset_dir / 'milo.onnx'}", flush=True)
     return 0
 

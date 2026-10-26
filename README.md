@@ -19,7 +19,7 @@ Milo sits in a room, listens for a wake phrase, and holds a spoken conversation 
 
 The default path is speech-to-speech over a WebSocket (`grok-voice-latest`, voice `eve`). A local cascade (faster-whisper, Grok chat, Piper) stays available when you set `conversation.engine` to `local`.
 
-Until a custom model clears the validation bar, the wake phrase is **hey jarvis**. The product name is Milo. A Milo ONNX model ships in [`assets/wakewords/milo.onnx`](assets/wakewords/milo.onnx) and also hears "hey milo". It is not the default: on the openWakeWord validation set the best row is about 0.80 recall with roughly 31 false accepts per hour, and confusable phrases such as Miles and Mylo still get through. Numbers and the threshold to try are in [`assets/wakewords/MODEL_CARD.md`](assets/wakewords/MODEL_CARD.md). Set `wake.model: milo` and `wake.phrase: "milo"` to use it. If `milo.onnx` is missing, the runtime says so and scores hey_jarvis.
+Until a custom model clears the validation bar, the wake phrase is **hey jarvis**. The product name is Milo. [`assets/wakewords/milo.onnx`](assets/wakewords/milo.onnx) is trained for **hey milo**. Bare **milo** is a secondary phrase, about one synthetic clip in five. It is not the default: the synthetic hey-milo run reaches about 0.90 recall with about 6 false accepts per hour, and still accepts confusable phrases about a quarter of the time. The full table is in [`assets/wakewords/MODEL_CARD.md`](assets/wakewords/MODEL_CARD.md). Set `wake.model: milo` and `wake.phrase: "hey milo"` to use it. If `milo.onnx` is missing, the runtime says so and scores hey_jarvis.
 
 ## Architecture
 
@@ -117,7 +117,7 @@ Non-secret settings live in `/etc/gva/config.yaml`, seeded from [`config/config.
 | `audio.playback_prebuffer_ms` | `200` | Audio queued before the speaker leaves silence |
 | `audio.playback_latency` | `high` | PortAudio latency hint (`high` or `low`) |
 | `wake.model` | `hey_jarvis` | `hey_jarvis`, or `milo` for the shipped ONNX file |
-| `wake.phrase` | `hey jarvis` | Phrase you say. Use `milo` when `wake.model` is `milo` |
+| `wake.phrase` | `hey jarvis` | Phrase you say. Use `hey milo` when `wake.model` is `milo` |
 | `wake.threshold` | `0.6` | Score that counts as a hit |
 | `wake.patience_frames` | `2` | Hits in a row before the session opens |
 | `wake.cooldown_seconds` | `3` | Quiet time after a session |
@@ -226,11 +226,38 @@ The installed default is hey_jarvis, threshold 0.6, two frames in a row. To try 
 ```yaml
 wake:
   model: milo
-  phrase: "milo"
+  phrase: "hey milo"
   threshold: 0.6
 ```
 
-`milo` also hears "hey milo". The validation sweep does not yet justify making that the default. Tune the threshold on the AIRHUG with `gva wake test` before leaving it on.
+The model is aimed at "hey milo". Bare "milo" is still in the training mix, so it can score, but it is the secondary phrase. On the synthetic set the widest gap is threshold 0.55 (recall 0.895, about 6 false accepts per hour, confusable accept 0.240). Recall is higher and generic false accepts are lower than the earlier half-and-half milo / hey milo model, and confusable phrases still get through. That does not clear the bar, so hey jarvis stays the default. If you try milo, start at 0.60 and tune it on the AIRHUG with `gva wake test`. That command tells you to say "hey milo" when the loaded file is `milo.onnx`.
+
+### Recording real Hey Milo clips
+
+`gva wake record` uses the same microphone setting as the voice runtime (`audio.input_device`, the AIRHUG). It stops `gva-voice` while it has the microphone and starts the service again when it finishes. If it cannot stop the service, it prints the command to run and does not record.
+
+On the Pi:
+
+```bash
+sudo gva wake record
+sudo gva wake export
+```
+
+`record` asks for 50 takes of "Hey Milo" (the style changes every ten takes: normal, quieter, from across the room, faster, slower), about 20 confusable and ordinary sentences shown on screen, and about three minutes of room background. Each take is announced on screen and with a short beep. Speech takes are 16 kHz mono WAVs, trimmed with the energy VAD. The room recording is left untrimmed. Files go to `/var/lib/gva/wake-samples/<date>/{positive,negative,background}`.
+
+Stopping halfway is safe. Run `sudo gva wake record` again the same day and it skips takes that are already on disk. A finished day prints where the files are and a one-line count, and does not record them again.
+
+`export` writes `/tmp/milo-samples.tar.gz` (mode `0644`). When you use sudo it is owned by the login user. Copy that file off the Pi and unpack it where you train.
+
+### Fine-tuning on those clips
+
+Unpack the archive and point the trainer at the date folder. Real positives and real negatives are mixed with the existing synthetic clips. Real positives are augmented the same way as the synthetic ones. One fifth of each real class, when there are at least five clips, is held out and is not trained on. The script prints those held-out scores next to the synthetic metrics.
+
+```bash
+python tools/wake/train_milo.py --train --real-samples /path/to/2026-10-26 --steps 8000
+```
+
+Run that with the training virtualenv that already has the openWakeWord datasets, not on the Pi. The primary phrase stays "hey milo". "milo" stays the secondary phrase. This run did not have AIRHUG clips yet, so the shipped model card is the synthetic hey-milo training only.
 
 ### Speaker format
 
@@ -278,7 +305,7 @@ The dashboard reads Supabase with the anon key under row-level security. The ser
 
 ## Roadmap
 
-- The Milo wake model is trained and shipped, but hey jarvis stays the default until a run clears the validation bar in `assets/wakewords/MODEL_CARD.md`. Try it with `wake.model: milo`.
+- The Milo wake model is trained for "hey milo" (bare "milo" is secondary) and ships in the repo, but hey jarvis stays the default until a run clears the validation bar in `assets/wakewords/MODEL_CARD.md`. Try it with `wake.model: milo` and `wake.phrase: "hey milo"`. Record real takes with `sudo gva wake record`.
 - The Voice Ops Dashboard, reading redacted telemetry from Supabase.
 - The local whisper / Piper cascade remains the fallback when the realtime socket should stay closed.
 

@@ -1,8 +1,8 @@
 """Wake-word scoring.
 
 The stock model is openWakeWord's hey_jarvis ("hey jarvis"). `wake.model: milo`
-loads the shipped Milo ONNX file, which is trained to accept "milo" and
-"hey milo". If that file is missing, scoring falls back to hey_jarvis.
+loads the shipped Milo ONNX file, trained for "hey milo" with bare "milo" as a
+secondary phrase. If that file is missing, scoring falls back to hey_jarvis.
 
 Models are ONNX. tflite-runtime has no wheel for Python 3.13, so this process
 never asks openWakeWord for the TFLite interpreter.

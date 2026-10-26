@@ -489,7 +489,7 @@ def wake_test(
     typer.echo(f"phrase: {cfg.wake.phrase}")
     typer.echo(f"threshold: {cfg.wake.threshold:.2f}  patience: {cfg.wake.patience_frames} frames")
     if spec.endswith("milo.onnx"):
-        typer.echo('Say "milo" or "hey milo".')
+        typer.echo('Say "hey milo". "milo" is also accepted.')
     elif engine.fell_back:
         typer.echo('Say "hey jarvis".')
     else:
@@ -529,6 +529,123 @@ def wake_test(
         f"threshold is {cfg.wake.threshold:.2f}. "
         "Raise it if the room false-wakes. Lower it if the phrase is missed."
     )
+
+
+def _capture_16k(capture, seconds: float, capture_rate: int, sample_rate: int) -> bytes:
+    from gva.runtime.audio import resample_pcm
+
+    deadline = time.monotonic() + seconds
+    chunks: list[bytes] = []
+    while time.monotonic() < deadline:
+        raw = capture.read(0.5)
+        if not raw:
+            continue
+        heard = resample_pcm(raw, capture_rate, sample_rate)
+        if heard:
+            chunks.append(heard)
+    return b"".join(chunks)
+
+
+def _play_beep(cfg) -> None:
+    from gva.runtime.audio import SoundDeviceSink, resolve_device, tone
+
+    sink = SoundDeviceSink(
+        resolve_device(cfg.audio.output_device, "output"),
+        cfg.audio.sample_rate,
+        prebuffer_ms=50,
+        latency="low",
+    )
+    try:
+        sink.write(tone(180, freq=880, amp=6000, sample_rate=cfg.audio.sample_rate))
+        time.sleep(0.45)
+    except Exception as exc:
+        typer.echo(f"beep skipped: {exc.__class__.__name__}", err=True)
+    finally:
+        sink.stop()
+
+
+@wake_app.command("record")
+def wake_record(
+    positives: int = typer.Option(50, "--positives", min=1, max=200, help="Hey Milo takes."),
+    negatives: int = typer.Option(20, "--negatives", min=1, max=100, help="Confusable and chat takes."),
+    background_seconds: float = typer.Option(180, "--background-seconds", min=10, max=600),
+    date: str = typer.Option("", "--date", help="Folder name. Default is today. Re-running the same date resumes."),
+    directory: Path = typer.Option(None, "--dir", help="Sample root. Default is /var/lib/gva/wake-samples."),
+) -> None:
+    """Record Hey Milo, confusable phrases, and room background on the AIRHUG.
+
+    Stops gva-voice while the microphone is in use and starts it again afterwards.
+    Takes already saved for this date are skipped.
+    """
+    from datetime import date as date_cls
+
+    from gva.runtime.audio import SoundDeviceCapture, list_devices, resolve_device
+    from gva.runtime.wake_samples import SAMPLES_ROOT, SampleSession, stop_voice_service
+
+    cfg = _cfg()
+    devices = list_devices()
+    if devices and devices[0].get("error"):
+        typer.echo(devices[0]["error"], err=True)
+        raise typer.Exit(1)
+    folder = date or date_cls.today().isoformat()
+    root = directory or SAMPLES_ROOT
+    session = SampleSession(
+        root,
+        folder,
+        positives=positives,
+        negatives=negatives,
+        background_seconds=background_seconds,
+        energy_threshold=cfg.vad.energy_threshold,
+    )
+    try:
+        session.day.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        typer.echo(f"Cannot write {session.day}: {exc.__class__.__name__}. Run `sudo gva wake record`.", err=True)
+        raise typer.Exit(1) from exc
+    if session.complete():
+        typer.echo(f"Files: {session.day}")
+        typer.echo(session.summary())
+        typer.echo("Nothing left to record. Export with `sudo gva wake export`.")
+        return
+    restart = stop_voice_service()
+    typer.echo("Stopped gva-voice.service." if restart.__name__ != "<lambda>" else "gva-voice.service was not running.")
+    capture = SoundDeviceCapture(
+        resolve_device(cfg.audio.input_device, "input"),
+        cfg.audio.capture_rate,
+        cfg.audio.chunk_ms,
+    )
+    try:
+        capture.start()
+    except Exception as exc:
+        restart()
+        typer.echo(f"microphone failed: {exc.__class__.__name__}: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    def grab(seconds: float) -> bytes:
+        return _capture_16k(capture, seconds, cfg.audio.capture_rate, cfg.audio.sample_rate)
+
+    try:
+        session.record(grab, lambda: _play_beep(cfg), typer.echo)
+    finally:
+        capture.stop()
+        restart()
+        if restart.__name__ != "<lambda>":
+            typer.echo("Started gva-voice.service.")
+    typer.echo("Export a copy you can take off the Pi with `sudo gva wake export`.")
+
+
+@wake_app.command("export")
+def wake_export(
+    date: str = typer.Option("", "--date", help="One day. Default packs every day under the sample root."),
+    directory: Path = typer.Option(None, "--dir", help="Sample root. Default is /var/lib/gva/wake-samples."),
+    output: Path = typer.Option(None, "--output", help="Archive path. Default is /tmp/milo-samples.tar.gz."),
+) -> None:
+    """Tar the wake samples to /tmp/milo-samples.tar.gz for copying off the Pi."""
+    from gva.runtime.wake_samples import EXPORT_PATH, SAMPLES_ROOT, export_samples
+
+    dest = export_samples(directory or SAMPLES_ROOT, output or EXPORT_PATH, date or None)
+    size = dest.stat().st_size
+    typer.echo(f"Wrote {dest} ({size} bytes). Copy that file off the Pi.")
 
 
 @auth_app.command("token")
