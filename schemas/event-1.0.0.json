@@ -10,7 +10,7 @@
     "type": {"type": "string", "enum": [
       "app.started", "app.stopped", "heartbeat", "state.changed", "wake.detected",
       "stt.completed", "llm.started", "llm.completed", "tool.started", "tool.completed",
-      "tool.rejected", "tts.completed", "playback.completed", "turn.completed", "error",
+      "tool.rejected", "tts.completed", "playback.completed", "playback.underrun", "turn.completed", "error",
       "config.changed", "budget.threshold", "budget.degraded", "eval.case", "eval.summary",
       "sync.completed", "audio.device_lost",
       "bridge.sent", "bridge.answered", "bridge.timeout", "bridge.error",

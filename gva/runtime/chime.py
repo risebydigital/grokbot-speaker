@@ -71,18 +71,34 @@ def chime_pcm(sample_rate: int = CANONICAL_RATE, volume: float = 1.0) -> bytes:
     return _scale(audio, int(round(PEAK * level)))
 
 
-def play_chime(sink, cfg=None, volume: float | None = None, *, raise_errors: bool = False) -> bytes:
-    """Write one chime. Device-rate sinks get a raw buffer so it is not resampled twice."""
+def play_chime(sink, cfg=None, volume: float | None = None, *, raise_errors: bool = False, protocol=None) -> bytes:
+    """Play one chime.
+
+    While the realtime player is running it is the only writer, so the chime
+    joins that queue at the sink's source rate. Otherwise a device-rate sink
+    gets a raw buffer so the chime is not resampled twice.
+    """
     if sink is None:
         return b""
     try:
-        resume = getattr(sink, "resume", None)
-        if resume:
-            resume()
         chosen = volume
         if chosen is None and cfg is not None:
             chosen = cfg.audio.chime_volume
         level = _volume(1.0 if chosen is None else chosen)
+        if (
+            protocol is not None
+            and getattr(protocol, "player_live", False)
+            and not getattr(protocol, "close", True)
+        ):
+            from gva.runtime.audio import play_pcm
+
+            rate = int(getattr(sink, "sample_rate", 0) or CANONICAL_RATE)
+            pcm = chime_pcm(rate, level)
+            play_pcm(sink, pcm, rate, protocol)
+            return pcm
+        resume = getattr(sink, "resume", None)
+        if resume:
+            resume()
         write_raw = getattr(sink, "write_raw", None)
         prepare = getattr(sink, "prepare", None)
         if callable(write_raw) and callable(prepare):

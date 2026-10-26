@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import queue
 import threading
 import time
@@ -28,7 +29,7 @@ from typing import Any
 
 from gva.config import Config, env_value
 from gva.ids import new_ulid, utc_now_ms
-from gva.runtime.audio import FALLBACK_PHRASE, play_fallback_phrase, resample_pcm
+from gva.runtime.audio import FALLBACK_PHRASE, StreamingResampler, load_fallback_pcm, resample_pcm
 from gva.runtime.bridge import (
     DEFER_LINE,
     NOT_YET_LINE,
@@ -47,6 +48,10 @@ from gva.telemetry.store import Store
 
 # After the speaker goes quiet, wait this long before a bridge reply starts.
 BRIDGE_QUIET_S = 0.6
+# Exit if the microphone or the wake loop makes no progress for this long.
+# systemd Restart=always then brings the process back. Independent of the
+# socket watchdog, which only closes one call.
+LOOP_STALL_S = 30.0
 _TRUNCATE_EVENTS = {
     "conversation.item.truncated",
     "conversation.item.truncate",
@@ -102,7 +107,7 @@ class RealtimeProtocol:
         self.last_activity = time.monotonic()
         self.last_socket = time.monotonic()
         # Decouples socket reads from the output device. The player task drains it.
-        self.playback: queue.Queue[bytes] = queue.Queue(maxsize=256)
+        self.playback: queue.Queue[bytes] = queue.Queue(maxsize=1024)
         self._user_text = ""
         self._assistant: list[str] = []
         self._tools: list[str] = []
@@ -129,6 +134,13 @@ class RealtimeProtocol:
         self._audio_item_id: str | None = None
         self._outbound_claim = False
         self._generation_done = False
+        self._armed_playback = False
+        self._input_resampler: StreamingResampler | None = None
+        self.mic_enabled = True
+        self.listen_until = 0.0
+        self.play_epoch = 0
+        # True only while _play_queued is the thread writing the speaker.
+        self.player_live = False
         self._bridge_items: list[dict[str, Any]] = []
         self._bridge_inflight: dict[str, Any] | None = None
         self._bridge_awaiting_audio: dict[str, Any] | None = None
@@ -165,7 +177,12 @@ class RealtimeProtocol:
 
     def audio_message(self, pcm_capture_rate: bytes) -> dict[str, str] | None:
         voice_rate = self.cfg.conversation.realtime.sample_rate
-        pcm = resample_pcm(pcm_capture_rate, self.cfg.audio.capture_rate, voice_rate)
+        capture_rate = self.cfg.audio.capture_rate
+        resampler = self._input_resampler
+        if resampler is None or resampler.from_rate != capture_rate or resampler.to_rate != voice_rate:
+            resampler = StreamingResampler(capture_rate, voice_rate)
+            self._input_resampler = resampler
+        pcm = resampler.process(pcm_capture_rate)
         if len(pcm) < 2:
             return None
         if self._stt_started is None:
@@ -191,6 +208,12 @@ class RealtimeProtocol:
             return []
         if etype in _TRUNCATE_EVENTS:
             if self._foreign_audio_event(event):
+                return []
+            # The server drops its own buffer when the next response starts.
+            # Audio we already queued still has to play, or one reply cuts off
+            # the previous one. A barge-in sets _cancel_pending and does drain.
+            if etype == "output_audio_buffer.cleared" and not self._cancel_pending:
+                self.note_activity()
                 return []
             self.speaking = False
             self.drain_playback()
@@ -332,26 +355,54 @@ class RealtimeProtocol:
             return
         self._response_pcm_bytes += len(pcm) - (len(pcm) % 2)
         self.speaking = True
+        self._armed_playback = True
         self._was_busy = True
         self._line_idle_since = None
+        self.listen_until = 0.0
         try:
             self.playback.put_nowait(pcm)
         except queue.Full:
-            try:
-                self.playback.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self.playback.put_nowait(pcm)
-            except queue.Full:
-                pass
+            # Drop the newest chunk. Dropping the oldest opens a hole in the
+            # middle of the sentence already queued.
+            return
 
     def drain_playback(self) -> None:
-        while True:
+        """Drop queued audio. Bounded so a producer cannot keep this spinning."""
+        self.play_epoch += 1
+        dropped = 0
+        while dropped < 100000:
             try:
                 self.playback.get_nowait()
             except queue.Empty:
                 return
+            dropped += 1
+
+    def note_output_idle(self) -> None:
+        """Start the follow-up window once the speaker, not the queue, is quiet."""
+        # A model response stays "speaking" until response.done so a bridge
+        # reply cannot start in a gap between audio deltas. A chime or a local
+        # clip has no open response; clear it once the device has drained.
+        if not self._response_active and not self._cancel_pending and not self._need_response_create:
+            if not self._output_queued():
+                self.speaking = False
+        self.note_drained()
+        if self._response_active or self._cancel_pending or self._need_response_create:
+            return
+        if self.speaking or self._output_queued():
+            return
+        if not self._armed_playback:
+            return
+        self._armed_playback = False
+        self.mic_enabled = True
+        resume = getattr(self.sink, "resume", None)
+        if callable(resume):
+            try:
+                resume()
+            except Exception:
+                pass
+        now = time.monotonic()
+        hold = float(getattr(self.cfg.conversation.realtime, "listen_after_playback_s", 8) or 8)
+        self.listen_until = now + hold
 
     def cancel_playback(self) -> dict[str, str]:
         """Drop the current reply. A bridge answer that has not been confirmed stays queued."""
@@ -496,6 +547,9 @@ class RealtimeProtocol:
 
     def _finish_turn(self, event: dict[str, Any], status: str, intent: str | None) -> None:
         rate = self.cfg.conversation.realtime.sample_rate
+        # Milliseconds round a short chunk down to zero. Any received PCM is
+        # still a reply, and the silence fallback must not join the same queue.
+        heard_audio = self._response_pcm_bytes >= 2
         audio_ms = _pcm_ms(self._response_pcm_bytes, rate)
         defer_fallback = self._defer_silence_fallback
         self._defer_silence_fallback = False
@@ -506,13 +560,13 @@ class RealtimeProtocol:
             and not self._user_text
             and not self._assistant
             and status == "ok"
-            and audio_ms == 0
+            and not heard_audio
         ):
             usage = _usage(event)
             self._account(usage, event)
             return
         fallback = False
-        if status == "ok" and audio_ms == 0 and not defer_fallback:
+        if status == "ok" and not heard_audio and not defer_fallback:
             if ack_pending and ack_phrase:
                 self._bridge_ack_pending = False
                 extra = self._speak_phrase(ack_phrase)
@@ -521,7 +575,7 @@ class RealtimeProtocol:
             if extra:
                 fallback = True
                 audio_ms += extra
-        elif audio_ms > 0:
+        elif heard_audio:
             self._bridge_ack_pending = False
         usage = _usage(event)
         cost = self._account(usage, event)
@@ -874,18 +928,16 @@ class RealtimeProtocol:
             return 0
         if not pcm:
             return 0
-        target = int(getattr(self.sink, "sample_rate", 0) or self.cfg.conversation.realtime.sample_rate or rate)
-        if rate != target:
-            pcm = resample_pcm(pcm, rate, target)
-            rate = target
-        try:
-            self.sink.write(pcm)
-        except Exception:
-            return 0
-        return int(len(pcm) / 2 / max(rate, 1) * 1000)
+        return self._enqueue_local(pcm, rate)
 
     def _speak_fallback(self) -> int:
-        player = self.fallback_player or play_fallback_phrase
+        player = self.fallback_player
+        if player is None:
+            try:
+                pcm, rate = load_fallback_pcm()
+            except OSError:
+                return 0
+            return self._enqueue_local(pcm, rate)
         try:
             result = player(self.sink, self.cfg, FALLBACK_PHRASE)
         except Exception:
@@ -896,6 +948,23 @@ class RealtimeProtocol:
             return max(0, int(result))
         except (TypeError, ValueError):
             return 0
+
+    def _enqueue_local(self, pcm: bytes, rate: int) -> int:
+        """Hand a whole clip to the player so it shares the pre-buffer."""
+        if not pcm:
+            return 0
+        target = int(getattr(self.sink, "sample_rate", 0) or self.cfg.conversation.realtime.sample_rate or rate)
+        if rate != target:
+            pcm = resample_pcm(pcm, rate, target)
+            rate = target
+        resume = getattr(self.sink, "resume", None)
+        if callable(resume):
+            try:
+                resume()
+            except Exception:
+                pass
+        self.enqueue_pcm(pcm)
+        return int(len(pcm) / 2 / max(rate, 1) * 1000)
 
     def _take_underruns(self) -> int:
         consume = getattr(self.sink, "consume_underruns", None)
@@ -1040,13 +1109,33 @@ class RealtimeAssistant:
         if heads is not None:
             heads.on_follow_up = self._follow_up.set
         self.shutdown = __import__("threading").Event()
-        self._last_heartbeat = time.monotonic()
+        self._stop = threading.Event()
+        now = time.monotonic()
+        self._wake_at = now
+        self._session_at = now
+        self._in_session = False
+        self._loops_started = False
+        self._stall_s = LOOP_STALL_S
+        self._halt = os._exit
+        self._aec_lock = threading.Lock()
+        self._wake_resample: StreamingResampler | None = None
+        self._heartbeat_thread: threading.Thread | None = None
+        self._watchdog_thread: threading.Thread | None = None
         self.sessions = 0
 
     def run(self, max_sessions: int | None = None) -> None:
         if self.heads is not None:
             self.heads.start()
-        self.capture.start()
+        self._loops_started = True
+        now = time.monotonic()
+        self._wake_at = now
+        self._session_at = now
+        try:
+            self.capture.start()
+        except Exception as exc:
+            self._log_failure(exc, "audio.capture", "capture", "audio")
+            raise
+        self._start_supervision()
         self.events.emit(
             "app.started",
             model=self.cfg.conversation.realtime.model,
@@ -1058,30 +1147,27 @@ class RealtimeAssistant:
         )
         try:
             while not self.shutdown.is_set():
-                self._heartbeat()
                 if not self._wait_for_wake():
                     break
                 started = time.monotonic()
+                self._in_session = True
+                self._session_at = started
                 try:
                     asyncio.run(self._session())
                 except Exception as exc:
-                    self.events.emit(
-                        "error",
-                        level="error",
-                        category="network",
-                        error_code="net.offline",
-                        message=_safe(exc.__class__.__name__),
-                        stage="realtime",
-                        retryable=True,
-                        retry_count=0,
-                        fallback_spoken=False,
-                    )
+                    self._log_failure(exc, "net.offline", "realtime", "network")
+                finally:
+                    self._in_session = False
+                    self._wake_at = time.monotonic()
                 self._speak_bridge_leftover()
                 self.sessions += 1
                 self._after_session(time.monotonic() - started)
                 if max_sessions is not None and self.sessions >= max_sessions:
                     break
         finally:
+            self._stop.set()
+            self.shutdown.set()
+            self._join_supervision()
             if self.heads is not None:
                 self.heads.stop()
             self.events.emit("app.stopped")
@@ -1089,6 +1175,94 @@ class RealtimeAssistant:
             close = getattr(self.sink, "close", None)
             if close:
                 close()
+
+    def _start_supervision(self) -> None:
+        """Heartbeats and the stall watchdog are not on the wake or session loop."""
+        self._stop.clear()
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, name="gva-heartbeat", daemon=True)
+        self._watchdog_thread = threading.Thread(target=self._watchdog_loop, name="gva-watchdog", daemon=True)
+        self._heartbeat_thread.start()
+        self._watchdog_thread.start()
+
+    def _join_supervision(self) -> None:
+        for thread in (self._heartbeat_thread, self._watchdog_thread):
+            if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=2.0)
+
+    def _heartbeat_loop(self) -> None:
+        interval = max(1.0, float(self.cfg.telemetry.heartbeat_seconds or 1))
+        while not self._stop.is_set():
+            try:
+                self._emit_heartbeat()
+            except Exception as exc:
+                self._log_failure(exc, "internal.heartbeat", "heartbeat", "internal")
+            if self._stop.wait(interval):
+                return
+
+    def _watchdog_loop(self) -> None:
+        while not self._stop.wait(1.0):
+            self._watchdog_once()
+
+    def _watchdog_once(self) -> None:
+        if self._stop.is_set() or self.shutdown.is_set() or not self._loops_started:
+            return
+        now = time.monotonic()
+        limit = float(self._stall_s)
+        reasons: list[str] = []
+        if self._capture_stalled(now, limit):
+            reasons.append("audio")
+        if self._in_session and (now - self._session_at) > limit:
+            reasons.append("audio")
+        elif not self._in_session and (now - self._wake_at) > limit:
+            reasons.append("wake")
+        if not reasons:
+            return
+        unique = []
+        for reason in reasons:
+            if reason not in unique:
+                unique.append(reason)
+        what = " and ".join(unique)
+        self._log_failure(
+            RuntimeError(f"{what} loop stalled for {int(limit)}s"),
+            "audio.stalled" if "audio" in unique else "internal.stalled",
+            "watchdog",
+            "audio" if "audio" in unique else "internal",
+        )
+        closer = getattr(self.events, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
+        self._halt(1)
+
+    def _capture_stalled(self, now: float, limit: float) -> bool:
+        capture = self.capture
+        if not getattr(capture, "running", False):
+            return False
+        last = getattr(capture, "last_audio_at", None)
+        if last is None:
+            return False
+        return (now - float(last)) > limit
+
+    def _log_failure(self, exc: BaseException, code: str, stage: str, category: str) -> None:
+        events = self.events
+        if events is None or not hasattr(events, "emit"):
+            return
+        try:
+            events.emit(
+                "error",
+                level="error",
+                category=category,
+                error_code=code,
+                message=_safe(f"{exc.__class__.__name__}: {exc}"),
+                stage=stage,
+                retryable=True,
+                retry_count=0,
+                fallback_spoken=False,
+            )
+        except Exception:
+            return
 
     def _speak_bridge_leftover(self) -> None:
         leftover = self._bridge_leftover
@@ -1108,6 +1282,7 @@ class RealtimeAssistant:
 
     def _wait_for_wake(self) -> bool:
         while not self.shutdown.is_set():
+            self._wake_at = time.monotonic()
             if self._follow_up.is_set():
                 self._follow_up.clear()
                 seconds = getattr(self.cfg.bot_bridge, "nudge_follow_up_s", None)
@@ -1118,7 +1293,7 @@ class RealtimeAssistant:
                 return False
             if frame == b"":
                 continue
-            pcm = resample_pcm(frame, self.cfg.audio.capture_rate, self.cfg.audio.sample_rate)
+            pcm = self._wake_pcm(frame)
             score = self.wake.score(pcm)
             if self.wake.observe(score, time.monotonic()):
                 self.events.emit(
@@ -1129,6 +1304,22 @@ class RealtimeAssistant:
                 )
                 return True
         return False
+
+    def _wake_pcm(self, frame: bytes) -> bytes:
+        capture_rate = self.cfg.audio.capture_rate
+        sample_rate = self.cfg.audio.sample_rate
+        resampler = self._wake_resample
+        if resampler is None or resampler.from_rate != capture_rate or resampler.to_rate != sample_rate:
+            resampler = StreamingResampler(capture_rate, sample_rate)
+            self._wake_resample = resampler
+        return resampler.process(frame)
+
+    def _barge_score(self, frame: bytes, aec) -> float:
+        heard = self._wake_pcm(frame)
+        if aec is not None:
+            with self._aec_lock:
+                heard = aec.process(heard)
+        return float(self.wake.score(heard))
 
     async def _session(self) -> None:
         key = env_value("XAI_API_KEY")
@@ -1177,6 +1368,7 @@ class RealtimeAssistant:
 
     async def _run_socket(self, ws, protocol: RealtimeProtocol, aec, started: float) -> None:
         await ws.send(json.dumps(protocol.session_update()))
+        protocol.player_live = True
         player = asyncio.create_task(self._play_queued(protocol, aec))
         sender = asyncio.create_task(self._send_audio(ws, protocol, aec))
         watchdog = asyncio.create_task(self._watchdog(ws, protocol))
@@ -1199,6 +1391,7 @@ class RealtimeAssistant:
                 if protocol.close:
                     break
         finally:
+            protocol.player_live = False
             protocol.close = True
             for task in (sender, player, watchdog, bridge_tx):
                 task.cancel()
@@ -1241,17 +1434,48 @@ class RealtimeAssistant:
                 await asyncio.sleep(0.2)
 
     async def _play_queued(self, protocol: RealtimeProtocol, aec) -> None:
-        """Drain the playback queue on its own task so a slow device cannot stall the socket."""
+        """Drain the playback queue without polling. The sink's pre-buffer does the smoothing."""
         voice_rate = self.cfg.conversation.realtime.sample_rate
+        reference_rate = self.cfg.audio.sample_rate
+        resampler = StreamingResampler(voice_rate, reference_rate)
         while not protocol.close:
+            self._session_at = time.monotonic()
+            epoch = protocol.play_epoch
             try:
-                pcm = protocol.playback.get_nowait()
+                pcm = await asyncio.to_thread(protocol.playback.get, True, 0.2)
             except queue.Empty:
-                await asyncio.sleep(0.01)
+                protocol.note_output_idle()
+                self._emit_underruns(protocol)
                 continue
+            if protocol.close or epoch != protocol.play_epoch:
+                continue
+            resume = getattr(protocol.sink, "resume", None)
+            if callable(resume):
+                try:
+                    resume()
+                except Exception:
+                    pass
             protocol.sink.write(pcm)
             if aec is not None:
-                aec.push_reference(resample_pcm(pcm, voice_rate, self.cfg.audio.sample_rate))
+                reference = resampler.process(pcm)
+                with self._aec_lock:
+                    aec.push_reference(reference)
+            self._emit_underruns(protocol)
+
+    def _emit_underruns(self, protocol: RealtimeProtocol) -> None:
+        consume = getattr(protocol.sink, "consume_underruns", None)
+        if not callable(consume) or self.events is None:
+            return
+        try:
+            count = int(consume())
+        except Exception:
+            return
+        if count <= 0:
+            return
+        try:
+            self.events.emit("playback.underrun", level="warning", count=count, underruns=count)
+        except Exception:
+            return
 
     async def _watchdog(self, ws, protocol: RealtimeProtocol) -> None:
         limit = self.cfg.conversation.realtime.watchdog_s
@@ -1276,7 +1500,10 @@ class RealtimeAssistant:
     async def _send_audio(self, ws, protocol: RealtimeProtocol, aec) -> None:
         voice = self.cfg.conversation.realtime
         while not protocol.close and not self.shutdown.is_set():
-            # Idle follows server conversation events. A live microphone must not refresh it.
+            self._session_at = time.monotonic()
+            # Idle follows server conversation events and the end of playback.
+            # A live microphone must not refresh it. The mic stays unmuted.
+            protocol.mic_enabled = True
             silence_s = self._session_silence_s if self._session_silence_s is not None else voice.silence_timeout_s
             if idle_should_close(protocol, self.bridge, time.monotonic(), silence_s):
                 protocol.close = True
@@ -1290,10 +1517,7 @@ class RealtimeAssistant:
             if not frame:
                 continue
             if protocol.speaking and self.cfg.conversation.barge_in != "off":
-                heard = resample_pcm(frame, self.cfg.audio.capture_rate, self.cfg.audio.sample_rate)
-                if aec is not None:
-                    heard = aec.process(heard)
-                score = self.wake.score(heard)
+                score = await asyncio.to_thread(self._barge_score, frame, aec)
                 if self.wake.observe(score, time.monotonic()):
                     self.events.emit(
                         "wake.detected",
@@ -1318,37 +1542,51 @@ class RealtimeAssistant:
             flush()
         deadline = time.monotonic() + self.cfg.wake.cooldown_seconds
         while time.monotonic() < deadline and not self.shutdown.is_set():
+            self._wake_at = time.monotonic()
             frame = self.capture.read(0.2)
             if frame is None:
                 break
         if flush:
             flush()
 
-    def _heartbeat(self) -> None:
-        now = time.monotonic()
-        if now - self._last_heartbeat < self.cfg.telemetry.heartbeat_seconds:
-            return
-        self._last_heartbeat = now
+    def _emit_heartbeat(self) -> None:
         from pathlib import Path
 
         from gva.telemetry.system import snapshot
 
         metrics = snapshot(Path(self.cfg.telemetry.log_dir))
+        queued = getattr(self.capture, "queued", None)
+        depth = int(queued()) if callable(queued) else 0
+        cpu = float(metrics["cpu_pct"] or 0)
+        # The schema caps one core. A Pi at 190% is still "as busy as it gets".
         self.events.emit(
             "heartbeat",
-            cpu_pct=float(metrics["cpu_pct"] or 0),
+            cpu_pct=min(100.0, cpu),
             mem_pct=float(metrics["mem_pct"] or 0),
             disk_pct=float(metrics["disk_pct"] or 0),
             temp_c=metrics["temp_c"],
             throttled=bool(metrics["throttled"]) if metrics["throttled"] is not None else False,
-            queue_depths={"capture": 0},
+            queue_depths={"capture": depth},
             api_reachable=True,
         )
 
 
 def idle_should_close(protocol, bridge, now: float, silence_s: float) -> bool:
-    """Silence ends a call, except while a team answer is still on its way."""
+    """Silence ends a call, except while audio is still coming out or a follow-up window is open.
+
+    The follow-up window starts when playback finishes, not when the audio was queued.
+    """
     if bridge is not None and bridge.holds_session():
+        return False
+    pending = getattr(protocol, "playback_pending", None)
+    if callable(pending):
+        try:
+            if pending():
+                return False
+        except Exception:
+            return False
+    listen_until = float(getattr(protocol, "listen_until", 0.0) or 0.0)
+    if now < listen_until:
         return False
     return protocol.idle(now, silence_s)
 

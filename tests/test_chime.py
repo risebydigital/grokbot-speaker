@@ -107,6 +107,21 @@ def test_device_sink_gets_a_raw_device_rate_buffer():
     assert sink._source_bytes == 0
 
 
+def test_a_live_player_queues_the_approved_chime():
+    from gva.runtime.realtime import RealtimeProtocol
+
+    sink = CollectingSink()
+    sink.sample_rate = 24000
+    protocol = RealtimeProtocol(Config(), None, None, None, sink)
+    protocol.player_live = True
+    pcm = play_chime(sink, Config(), protocol=protocol)
+    assert sink.chunks == []
+    assert protocol.playback.get_nowait() == pcm == chime_pcm(24000, 1.0)
+    protocol.close = True
+    direct = play_chime(sink, Config(), protocol=protocol)
+    assert b"".join(sink.chunks) == direct == chime_pcm(24000, 1.0)
+
+
 def test_heads_up_and_bridge_replace_the_old_beeps(tmp_path):
     cfg = Config()
     cfg.telemetry.log_dir = str(tmp_path / "log")
